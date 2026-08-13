@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# Build a Koi-DOS program.
+#
+#   ./koicc hello.c                  -> HELLO.EXE
+#   ./koicc hello.c mytool           -> MYTOOL.EXE
+#   ./koicc main.c board.c ai.c      -> MAIN.EXE
+#   ./koicc main.c board.c -o games  -> GAMES.EXE
+#
+# Several sources are one program, not several: there is no linker to run
+# afterwards and no object files to keep. Anything larger than one file needs
+# this, and the first program that did was a games collection.
+#
+# Nothing here is Koi-DOS-specific tooling: it is an ordinary x86-64 GCC with
+# the flags that make its output run without an operating system underneath it.
+# Any compiler that can produce a freestanding ELF64 binary will do.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+SOURCES=()
+NAME=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift
+            [ $# -gt 0 ] || { echo "koicc: -o needs a name" >&2; exit 1; }
+            NAME=$1
+            ;;
+        *.c)
+            SOURCES+=("$1")
+            ;;
+        *)
+            # A bare word after the sources is the output name, which is how
+            # this was called before -o existed.
+            NAME=$1
+            ;;
+    esac
+    shift
+done
+
+if [ ${#SOURCES[@]} -eq 0 ]; then
+    echo "usage: koicc <source.c> [more.c ...] [-o name]" >&2
+    exit 1
+fi
+
+[ -n "$NAME" ] || NAME=$(basename "${SOURCES[0]}" .c)
+OUTPUT=$(echo "$NAME" | tr 'a-z' 'A-Z').EXE
+
+CC=${CC:-gcc}
+
+# The flags come from koiflags, which `make sdk` writes out of the Makefile
+# that builds Koi-DOS itself.
+#
+# They used to be written here as well, and the two copies drifted: the linker
+# script became position-independent and this did not, so every program built
+# with the SDK produced a fixed-address binary the loader refused. Two copies
+# of one truth is one copy too many.
+#
+# What they mean, for anybody reading:
+#   -ffreestanding     there is no C library and no hosted environment
+#   -fpie -pie         programs are loaded wherever there is room; see program.ld
+#   -mno-red-zone      the red zone is not safe when interrupts run on this stack
+#   -mgeneral-regs-only
+#                      forbid GCC from emitting SSE of its own accord: nothing
+#                      has set up SSE state, so a compiler XMM copy faults
+#   -nostdlib          no startup files, no libc; start.c is the entry point
+if [ ! -f koiflags ]; then
+    echo "koicc: koiflags is missing - this SDK copy is incomplete." >&2
+    echo "       It is written by \`make sdk\` and holds the build flags." >&2
+    exit 1
+fi
+. ./koiflags
+
+"$CC" $KOI_CFLAGS $KOI_LDFLAGS \
+    -o "$OUTPUT" "${SOURCES[@]}" start.c koilib.c
+
+ABI=$(sed -n 's/^#define KOI_ABI_VERSION \([0-9]*\).*/\1/p' syscall.h)
+ALPHA=$(sed -n 's/^#define KOI_ABI_IS_ALPHA \([0-9]*\).*/\1/p' syscall.h)
+
+echo "$OUTPUT  (interface version $ABI)"
+if [ "${ALPHA:-0}" = "1" ]; then
+    echo
+    echo "NOTE: the interface is ALPHA. Function numbers can still change, and"
+    echo "      a kernel with a different interface version will refuse to run"
+    echo "      this binary rather than misinterpret it. Rebuild after updating."
+fi
+echo
+echo "Copy it to the root of a Koi-DOS drive and type its name at the prompt."
+echo "With mtools, and the disk image at esp.img:"
+echo
+echo "    mcopy -o -i esp.img $OUTPUT ::/"
