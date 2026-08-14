@@ -1,6 +1,6 @@
 #include "koi.h"
 #include "window.h"
-#include "editcore.h"
+#include "mizu.h"
 #include "wav.h"
 #include "settings.h"
 #include "language.h"
@@ -26,20 +26,29 @@
 #define MENU_COMMANDER 5
 #define MENU_TILE 6
 #define MENU_NOTE 7
-#define MENU_BOLD 8
-#define MENU_ITALIC 9
-#define MENU_UNDERLINE 10
-#define MENU_PLAIN 11
-#define MENU_SAVE 12
+/* 8 to 12 were NoteEdit's - Save, Bold, Italic, Underline, Plain - and are
+   the application's own now. The numbers are left as a hole rather than
+   reused, because these ids travel through window.c and back, and a stale one
+   arriving at a number that has changed meaning is the one bug this costs
+   nothing to make impossible. */
 #define MENU_PLAYER 13
-#define MENU_STOP 14
-#define MENU_PAUSE 15
+#define MENU_FILES 16
+#define MENU_TERM 17
+/* 14 and 15 were the player's Stop and Pause, and are its own now. Left as a
+   hole rather than reused: these ids travel out through window.c and back. */
+
+/* The applications this desktop ships with. A name, not a path: it is loaded
+   from beside this program, wherever the package was installed. */
+#define NOTEEDIT "NOTEEDIT.APP"
+#define PLAYER "PLAYER.APP"
+#define FILES "FILES.APP"
+#define TERM "TERM.APP"
+#define IMAGE "IMAGE.APP"
+#define CONTROL "CONTROL.APP"
 
 static WINDOW* control_window;
 static WINDOW* clock_window;
 static WINDOW* about_window;
-static WINDOW* note_window;
-static WINDOW* player_window;
 
 static int current_volume_index(void) {
     long count = koi_sysinfo(KOI_INFO_VOLUME_COUNT, 0);
@@ -66,16 +75,17 @@ static koi_uint32 tint_setup(void) { return koi_gfx_color(0x4A, 0x8F, 0xB8); }
 static koi_uint32 tint_files(void) { return koi_gfx_color(0x35, 0xA6, 0xC4); }
 static koi_uint32 tint_tools(void) { return koi_gfx_color(0x58, 0xB0, 0xA8); }
 
-static ENTRY entries[5];
+static ENTRY entries[6];
 
 static void name_entries(void) {
-    entries[0] = (ENTRY){ say(SAY_COMMANDER), tint_files };
-    entries[1] = (ENTRY){ say(SAY_NOTEEDIT), tint_tools };
-    entries[2] = (ENTRY){ say(SAY_CLOCK), tint_setup };
-    entries[3] = (ENTRY){ "Player", tint_setup };
-    entries[4] = (ENTRY){ say(SAY_ABOUT), tint_tools };
+    entries[0] = (ENTRY){ say(SAY_FILES), tint_files };
+    entries[1] = (ENTRY){ say(SAY_COMMANDER), tint_files };
+    entries[2] = (ENTRY){ say(SAY_NOTEEDIT), tint_tools };
+    entries[3] = (ENTRY){ say(SAY_CLOCK), tint_setup };
+    entries[4] = (ENTRY){ "Player", tint_setup };
+    entries[5] = (ENTRY){ say(SAY_ABOUT), tint_tools };
 }
-#define ENTRY_COUNT 5
+#define ENTRY_COUNT 6
 
 #define ICON_W 120
 #define ICON_H 96
@@ -292,6 +302,15 @@ static void find_programs(void) {
     if (search >= 0) koi_findclose(search);
 }
 
+/* Is this character in that string? Two of these are needed to tell a bare
+   name from a command line, and there is no such call in the SDK. */
+static int koi_strchr_simple(const char* text, char wanted) {
+    for (int at = 0; text[at]; at++) if (text[at] == wanted) return 1;
+    return 0;
+}
+
+static void open_application(const char* file);
+
 /* Open the Start menu, and do what was chosen.
  *
  * Programs are listed straight rather than in a submenu: with a handful of
@@ -370,6 +389,43 @@ static void start_menu(void) {
             window_repaint();
             return;
         }
+        /* An application, if that is what was named.
+         *
+         * Written with .APP or without: `FILES` and `FILES.APP` mean the same
+         * thing here, because nobody should have to know that an application
+         * has a different extension from a program to open one. A bare name
+         * is looked for as an application first and handed to the shell only
+         * if there is no such file - so a program of the same name still
+         * runs, and typing `dir` still lists a directory. */
+        if (ends_with_ignoring_case(line, ".APP")) {
+            open_application(line);
+            window_repaint();
+            return;
+        }
+        {
+            char guess[128];
+            char beside[160];
+            int at = 0;
+
+            while (line[at] && at + 5 < (int)sizeof(guess)) {
+                guess[at] = line[at];
+                at++;
+            }
+            guess[at] = 0;
+            /* Only a bare word: anything with a dot, a backslash or an
+               argument is a command line and is the shell's business. */
+            if (at && !koi_strchr_simple(guess, '.') &&
+                !koi_strchr_simple(guess, '\\') &&
+                !koi_strchr_simple(guess, ' ')) {
+                strcpy(guess + at, ".APP");
+                if (koi_beside(guess, beside, sizeof(beside)) &&
+                    koi_exists(beside)) {
+                    open_application(guess);
+                    window_repaint();
+                    return;
+                }
+            }
+        }
         koi_gfx_leave();
         code = koi_run(line);
         if (window_reopen_desktop()) window_repaint();
@@ -378,10 +434,10 @@ static void start_menu(void) {
         return;
     }
     if (chosen == START_SETTINGS) {
-        if (control_window) {
-            control_window->minimised = 0;
-            window_raise(control_window);
-        }
+        /* Settings, and not the control panel: the panel is a page of things
+           to start, which is what Program Manager was. This is where the
+           machine's own switches live. */
+        open_application(CONTROL);
         return;
     }
     if (chosen >= START_FIRST_PROGRAM &&
@@ -396,12 +452,258 @@ static void start_menu(void) {
     }
 }
 
+/* ---- Applications --------------------------------------------------------
+ *
+ * NoteEdit used to be here, and is now NOTEEDIT.APP beside this program: an
+ * image Mizu loads, calls, and is handed a table of functions by. The contract
+ * is in mizu.h and the reasoning with it; what changes here is that the
+ * desktop no longer contains the things running on it.
+ *
+ * The table below is that contract's other half - everything an application
+ * cannot simply call for itself. Drawing, files, sound and the keyboard are
+ * system calls and need nothing from us; the windows, the theme, the phrases
+ * and the dialogues all live in variables inside window.c, and an application
+ * that linked its own copy of that would be drawing into a second desktop
+ * nobody can see.
+ */
+#define APPLICATION_MAX 8
+
+typedef struct {
+    char file[32];
+    KOI_MODULE module;
+    MIZU_APP* app;
+    WINDOW* window;
+} APPLICATION;
+
+static APPLICATION applications[APPLICATION_MAX];
+
+/* An application asking for something to be run. The screen is given up and
+   taken back here, because an application cannot know what else is on it. */
+static int open_file(const char* path);
+
+static int run_command(const char* command) {
+    int code;
+
+    if (!command || !command[0]) return -1;
+    koi_gfx_leave();
+    code = koi_run(command);
+    /* Whatever was typed at the program that has just ended belongs to it and
+       not to the desktop. Without this, quitting DOOM with F10 and Y handed
+       the desktop a Y, and the Escape somebody pressed to leave a menu closed
+       whichever window happened to be in front when it came back. */
+    while (koi_keypressed()) (void)koi_getchar();
+    if (window_reopen_desktop()) window_repaint();
+    return code;
+}
+
+/* Everything on the desktop that is a phrase, so that changing the language
+ * changes it now rather than at the next boot.
+ *
+ * say() hands back a pointer into the table for the language in force when it
+ * was called, and the menus keep those pointers. Setting the language and
+ * repainting therefore redraws the old words perfectly. This is the second
+ * copy of one truth turning up again in a new place, and the answer is the
+ * same as it was for the SDK: build the labels once, from one function, and
+ * call it again when the fact underneath changes. */
+static WINDOW_MENU* desktop_menus_here;
+static WINDOW_MENU* panel_menus_here;
+
+static void remember_labels(WINDOW_MENU* desktop, WINDOW_MENU* panel) {
+    desktop_menus_here = desktop;
+    panel_menus_here = panel;
+}
+
+static void relabel(void) {
+    if (!desktop_menus_here) return;
+
+    desktop_menus_here[0] = (WINDOW_MENU){ say(SAY_MENU_SYSTEM),
+        { { say(SAY_ABOUT), MENU_ABOUT }, { 0, 0 },
+          { say(SAY_EXIT), MENU_EXIT } }, 3 };
+    desktop_menus_here[1] = (WINDOW_MENU){ say(SAY_MENU_RUN),
+        { { say(SAY_FILES), MENU_FILES }, { say(SAY_NOTEEDIT), MENU_NOTE },
+          { "Player", MENU_PLAYER }, { "Koi-DOS", MENU_TERM },
+          { say(SAY_COMMANDER), MENU_COMMANDER } }, 5 };
+    desktop_menus_here[2] = (WINDOW_MENU){ say(SAY_MENU_VIEW),
+        { { say(SAY_CONTROL_PANEL), MENU_CONTROL },
+          { say(SAY_CLOCK), MENU_CLOCK }, { 0, 0 },
+          { say(SAY_TILE), MENU_TILE } }, 4 };
+    window_desktop_menu(desktop_menus_here, 3);
+    window_launcher(say(SAY_START));
+
+    if (panel_menus_here) {
+        panel_menus_here[0] = (WINDOW_MENU){ say(SAY_MENU_FILE),
+            { { say(SAY_COMMANDER), MENU_COMMANDER }, { 0, 0 },
+              { say(SAY_EXIT), MENU_EXIT } }, 3 };
+        panel_menus_here[1] = (WINDOW_MENU){ say(SAY_MENU_OPTIONS),
+            { { say(SAY_ABOUT), MENU_ABOUT } }, 1 };
+        if (control_window) {
+            control_window->menus[0] = panel_menus_here[0];
+            control_window->menus[1] = panel_menus_here[1];
+            strncpy(control_window->title, say(SAY_CONTROL_PANEL),
+                    WINDOW_TITLE_MAX - 1);
+        }
+    }
+    /* The windows the desktop opened itself carry their titles in their own
+       memory, so they need renaming too - a machine half in one language is
+       worse than one entirely in the wrong one. */
+    if (clock_window)
+        strncpy(clock_window->title, say(SAY_CLOCK), WINDOW_TITLE_MAX - 1);
+    if (about_window)
+        strncpy(about_window->title, say(SAY_ABOUT), WINDOW_TITLE_MAX - 1);
+    name_entries();
+    /* And every application that is loaded, because its menus hold the same
+       kind of pointer this one did. `version` says whether it has the field
+       at all: an application built before this existed has a shorter
+       structure, and reading past it would be calling whatever follows. */
+    for (int index = 0; index < APPLICATION_MAX; index++) {
+        MIZU_APP* app = applications[index].app;
+
+        if (app && app->version >= 3 && app->relabel) app->relabel();
+    }
+    window_repaint();
+}
+
+/* The language, as the desktop holds it. An application that linked its own
+   copy of language.c would set its own idea of it and leave this one alone -
+   which is what the settings window did until this was here. */
+static int api_language(void) { return language_current(); }
+static int api_language_count(void) { return LANGUAGE_COUNT; }
+static const char* api_language_name(int which) { return language_name(which); }
+
+static void api_language_set(int which) {
+    language_set(which);
+    relabel();
+}
+
+static koi_uint32 api_color(int which) {
+    switch (which) {
+    case MIZU_COLOR_FACE: return window_face;
+    case MIZU_COLOR_LIGHT: return window_light;
+    case MIZU_COLOR_SHADOW: return window_shadow;
+    case MIZU_COLOR_PAPER: return window_client_paper;
+    case MIZU_COLOR_ACCENT: return window_accent;
+    default: return window_text;
+    }
+}
+
+/* By name rather than by position.
+ *
+ * The version says what an application may expect, and this table is where
+ * that promise is actually kept: a field added to MIZU_API and forgotten here
+ * is a null pointer an application calls because the version told it it could.
+ * Written out by name, the omission is visible; written by position it is a
+ * comma nobody counts. */
+static const MIZU_API mizu_api = {
+    .version = MIZU_API_VERSION,
+    .window_new = window_new,
+    .window_delete = window_delete,
+    .window_raise = window_raise,
+    .window_client = window_client,
+    .repaint = window_repaint,
+    .label = window_label,
+    .label_styled = window_label_styled,
+    .raised = window_raised,
+    .sunken = window_sunken,
+    .color = api_color,
+    .confirm = window_confirm,
+    .message = window_message,
+    .prompt = window_prompt,
+    .say = say,
+    .yield = window_yield,
+    .run = run_command,
+    .open_file = open_file,
+    .language = api_language,
+    .language_count = api_language_count,
+    .language_name = api_language_name,
+    .language_set = api_language_set
+};
+
+/* Which application a window belongs to, or none. This is how a menu choice
+   in an application's window reaches the application: Mizu does not know what
+   the ids mean and hands them straight back. */
+static APPLICATION* application_of(const WINDOW* window) {
+    if (!window) return (APPLICATION*)0;
+    for (int index = 0; index < APPLICATION_MAX; index++)
+        if (applications[index].app && applications[index].window == window)
+            return &applications[index];
+    return (APPLICATION*)0;
+}
+
+/* Load it if it is not loaded, then ask it to open.
+ *
+ * Loaded once and kept: a module holds its own document, and loading it a
+ * second time would give a second NoteEdit with a second copy of the note,
+ * both writing to one file. */
+static APPLICATION* load_application(const char* file) {
+    APPLICATION* slot = (APPLICATION*)0;
+    char path[128];
+    MIZU_APP* (*entry)(const MIZU_API*);
+
+    for (int index = 0; index < APPLICATION_MAX; index++) {
+        APPLICATION* candidate = &applications[index];
+        if (candidate->app && !strcmp(candidate->file, file)) return candidate;
+        if (!candidate->app && !slot) slot = candidate;
+    }
+    if (!slot) return (APPLICATION*)0;
+
+    /* Beside this program, because that is where its package put it - dosget
+       chooses the directory, not us. */
+    if (!koi_beside(file, path, sizeof(path))) return (APPLICATION*)0;
+    if (koi_load(path, &slot->module) != 0) {
+        window_message(say(SAY_DESKTOP_TITLE), say(SAY_NO_APPLICATION),
+                       say(DIALOG_OK));
+        window_repaint();
+        return (APPLICATION*)0;
+    }
+    entry = (MIZU_APP* (*)(const MIZU_API*))(unsigned long)slot->module.entry;
+    slot->app = entry(&mizu_api);
+    if (!slot->app) {
+        koi_unload(slot->module.base);
+        return (APPLICATION*)0;
+    }
+    strncpy(slot->file, file, sizeof(slot->file) - 1);
+    slot->file[sizeof(slot->file) - 1] = 0;
+    return slot;
+}
+
+static void open_application(const char* file) {
+    APPLICATION* slot = load_application(file);
+
+    if (slot) slot->window = slot->app->open();
+}
+
+/* Which application opens a file of this kind.
+ *
+ * A table, and a short one on purpose. What it must not become is a registry -
+ * a place where installing something rewrites how the machine behaves, which
+ * is how a system stops being predictable. When a package wants to claim a
+ * suffix it will say so in its own .PKG record, and this will read that the
+ * way the Start menu already reads the rest. */
+static int open_file(const char* path) {
+    static const struct { const char* suffix; const char* application; }
+    openers[] = {
+        { ".BMP", IMAGE }, { ".TXT", NOTEEDIT }, { ".MD", NOTEEDIT },
+        { ".BAT", NOTEEDIT }, { ".CFG", NOTEEDIT }, { ".LOG", NOTEEDIT },
+        { 0, 0 }
+    };
+
+    if (!path || !path[0]) return 0;
+    for (int index = 0; openers[index].suffix; index++) {
+        APPLICATION* slot;
+
+        if (!ends_with_ignoring_case(path, openers[index].suffix)) continue;
+        slot = load_application(openers[index].application);
+        if (!slot || slot->app->version < 2 || !slot->app->open_with)
+            return 0;
+        slot->window = slot->app->open_with(path);
+        return slot->window != (WINDOW*)0;
+    }
+    return 0;
+}
+
 static void open_about(void);
 static void open_clock(void);
-static void open_note(void);
-static void open_player(void);
 static void start_commander(void);
-static void player_stop(void);
 
 /* Close one window and forget the pointer to it.
  *
@@ -411,14 +713,17 @@ static void player_stop(void);
  * to be stopped as well as deleted, and a closed player went on making a
  * noise. */
 static void close_window(WINDOW* window) {
+    APPLICATION* owner = application_of(window);
+
     if (!window) return;
+    /* An application is told before its window goes, because only it knows
+       whether there is anything to save first. */
+    if (owner) {
+        if (owner->app->closing) owner->app->closing(window);
+        owner->window = (WINDOW*)0;
+    }
     if (window == clock_window) clock_window = (WINDOW*)0;
     if (window == about_window) about_window = (WINDOW*)0;
-    if (window == note_window) note_window = (WINDOW*)0;
-    if (window == player_window) {
-        player_stop();
-        player_window = (WINDOW*)0;
-    }
     window_delete(window);
 }
 
@@ -437,10 +742,11 @@ static void click_control(WINDOW* window, int x, int y, int clicks) {
        to set it going, so a hand resting on the button does not launch it. */
     if (clicks < 2) return;
 
-    if (index == 0) start_commander();
-    else if (index == 1) open_note();
-    else if (index == 2) open_clock();
-    else if (index == 3) open_player();
+    if (index == 0) open_application(FILES);
+    else if (index == 1) start_commander();
+    else if (index == 2) open_application(NOTEEDIT);
+    else if (index == 3) open_clock();
+    else if (index == 4) open_application(PLAYER);
     else open_about();
 }
 
@@ -515,397 +821,6 @@ static void paint_clock(WINDOW* window, int x, int y, int width, int height) {
     }
 }
 
-/* ---- NoteEdit ------------------------------------------------------------
- *
- * The same editing core the console editor uses, drawn into a window instead
- * of onto a terminal. One buffer implementation, two front ends, for the
- * reason it was split out in the first place: a text buffer is where the
- * off-by-ones live and two copies written a week apart do not stay the same
- * shape.
- *
- * The style is the whole document's, which is not a shortcut - it is what
- * Notepad did, and for the same reason. A style that varies inside the text
- * needs a second buffer running alongside it saying where each run begins and
- * ends, and a plain text file has nowhere to keep that. The moment there is a
- * format that can, this becomes MizuWriter and the runs go in it.
- */
-#define NOTE_CAPACITY (64L * 1024L)
-#define NOTE_PATH "\\NOTE.TXT"
-
-static EDITOR note;
-static int note_ready;
-static int note_style;
-static long note_top_line;
-
-static void paint_note(WINDOW* window, int x, int y, int width, int height) {
-    long total = edit_lines(&note);
-    long caret_line = edit_line_of(&note, note.cursor);
-    int rows = height / WINDOW_CHAR_H;
-    int columns = width / WINDOW_CHAR_W;
-
-    (void)window;
-    if (rows < 1) rows = 1;
-
-    /* Keep the caret in view before drawing anything, so the first frame after
-       a keystroke already shows where it went. */
-    if (caret_line < note_top_line) note_top_line = caret_line;
-    if (caret_line >= note_top_line + rows) note_top_line = caret_line - rows + 1;
-    if (note_top_line < 0) note_top_line = 0;
-
-    for (int row = 0; row < rows && note_top_line + row < total; row++) {
-        long number = note_top_line + row;
-        long start = edit_line_start(&note, number);
-        long length = edit_line_length(&note, number);
-        char line[256];
-        long copied = 0;
-
-        while (copied < length && copied < columns && copied < 255) {
-            char character = note.text[start + copied];
-            line[copied] = (character == '\t') ? ' ' : character;
-            copied++;
-        }
-        line[copied] = 0;
-        window_label_styled(x + 2, y + row * WINDOW_CHAR_H, line, window_text,
-                            note_style);
-    }
-
-    {
-        int row = (int)(caret_line - note_top_line);
-        long column = edit_column_of(&note, note.cursor);
-        if (row >= 0 && row < rows)
-            koi_gfx_fill(x + 2 + (int)column * WINDOW_CHAR_W,
-                         y + row * WINDOW_CHAR_H, 2, WINDOW_CHAR_H,
-                         window_accent);
-    }
-}
-
-static void key_note(WINDOW* window, int key) {
-    (void)window;
-    switch (key) {
-    case KOI_KEY_LEFT:  edit_move_by(&note, -1, 0); break;
-    case KOI_KEY_RIGHT: edit_move_by(&note, 1, 0); break;
-    case KOI_KEY_UP:    edit_move_lines(&note, -1, 0); break;
-    case KOI_KEY_DOWN:  edit_move_lines(&note, 1, 0); break;
-    case KOI_KEY_HOME:  edit_move_home(&note, 0); break;
-    case KOI_KEY_END:   edit_move_end(&note, 0); break;
-    case KOI_KEY_DELETE: edit_delete(&note); break;
-    case '\b': edit_backspace(&note); break;
-    case '\n': case '\r': edit_insert_char(&note, '\n'); break;
-    case '\t': edit_insert(&note, "    ", 4); break;
-    default:
-        if (key >= ' ' && key < 0x100) edit_insert_char(&note, (char)key);
-        break;
-    }
-    window_repaint();
-}
-
-/* ---- The player ----------------------------------------------------------
- *
- * A list of the WAV files it can find, a bar, and the bar can be clicked.
- *
- * The bar is the whole point and it was impossible yesterday. The mixer walks
- * a sound in 32.32 fixed point so that a recording made at one rate can play
- * at another, and the whole part of that number is how far in it has got - it
- * always knew, and nothing had ever asked. Three calls later there is a
- * position, a length and a seek, and a progress bar is arithmetic.
- *
- * The samples stay in memory for as long as the sound plays, because the mixer
- * reads them where they are rather than copying them. Freeing the buffer while
- * a voice still points into it is the one way to make this crash, so the
- * buffer is freed when the voice is stopped and never before.
- */
-#define PLAYER_FILES 64
-#define PLAYER_PATH 96
-
-/* Whole files, in memory, for as long as they play.
- *
- * The mixer reads the samples where they are rather than copying them, so a
- * track is resident from the moment it starts until it is stopped. There is no
- * streaming: nothing in the audio interface can ask a program for more samples
- * partway through, and inventing that is a bigger change than a player.
- *
- * So the limit is memory, and it used to be a made-up four megabytes - which
- * at CD rates is twenty-three seconds, and is the sort of number that gets
- * written once and then quietly decides what the software is for. SYS_ALLOC
- * goes straight to the page allocator, so what is actually available is most
- * of the machine. A file is now measured before it is read and given exactly
- * what it needs, up to half of what is free - half, so that starting a long
- * track cannot leave the rest of the system with nothing. */
-static char tracks[PLAYER_FILES][PLAYER_PATH];
-static char player_message[80];
-static int track_count;
-static int track_playing = -1;
-static void* track_data;
-static unsigned int track_data_at;
-static int voice = -1;
-static WAV_FORMAT voice_format;
-static unsigned int voice_frames;
-static unsigned int player_paused_frame;
-static int player_paused;
-
-static void player_sync_pause_label(void) {
-    if (player_window) player_window->menus[0].items[0].label = player_paused ? "Resume" : "Pause";
-}
-
-static void player_stop(void) {
-    if (voice >= 0) koi_sound_stop(voice);
-    voice = -1;
-    if (track_data) { koi_free(track_data); track_data = 0; }
-    track_playing = -1;
-    player_paused = 0;
-    player_paused_frame = 0;
-    player_sync_pause_label();
-}
-
-static int player_start_from(unsigned int start_frame) {
-    if (start_frame >= voice_frames) return -1;
-    voice = koi_sound_play_simple((const char*)track_data + track_data_at,
-                                  voice_frames, voice_format.rate,
-                                  voice_format.bits == 16 ? KOI_SOUND_S16
-                                                          : KOI_SOUND_U8,
-                                  voice_format.channels, 255);
-    if (voice < 0) return -1;
-    if (start_frame && koi_sound_seek(voice, start_frame) < 0) {
-        koi_sound_stop(voice);
-        voice = -1;
-        return -1;
-    }
-    return 0;
-}
-
-static void player_pause(void) {
-    if (voice < 0 || !koi_sound_active(voice) || !track_data) return;
-    player_paused_frame = koi_sound_where(voice);
-    if (player_paused_frame >= voice_frames && voice_frames)
-        player_paused_frame = voice_frames - 1;
-    koi_sound_stop(voice);
-    voice = -1;
-    player_paused = 1;
-    player_message[0] = 0;
-    player_sync_pause_label();
-}
-
-static void player_resume(void) {
-    if (!player_paused || !track_data) return;
-    if (player_start_from(player_paused_frame) < 0) {
-        koi_snprintf(player_message, sizeof(player_message),
-                     "Every voice is busy");
-        return;
-    }
-    player_paused = 0;
-    player_paused_frame = 0;
-    player_message[0] = 0;
-    player_sync_pause_label();
-}
-
-static void player_toggle_pause(void) {
-    if (player_paused) player_resume();
-    else player_pause();
-}
-
-/* The root and the two directories somebody would actually keep music in.
-   Not a file browser: a player that can only see the root is a player nobody
-   can put a song in front of, and one that browses the disk is a different
-   program. */
-static void player_scan_in(const char* directory) {
-    KOI_FIND_DATA found;
-    char pattern[PLAYER_PATH];
-    long search;
-
-    koi_snprintf(pattern, sizeof(pattern), "%s*.WAV", directory);
-    search = koi_findfirst(pattern, &found);
-    if (search < 0) return;
-    do {
-        if (track_count >= PLAYER_FILES) break;
-        koi_snprintf(tracks[track_count], PLAYER_PATH, "%s%s", directory,
-                     found.name);
-        track_count++;
-    } while (koi_findnext(search, &found) == 0);
-    koi_findclose(search);
-}
-
-static void player_scan(void) {
-    track_count = 0;
-    player_scan_in("\\");
-    player_scan_in("\\MUSIC\\");
-    player_scan_in("\\WAV\\");
-}
-
-/* The last component of a path, which is what a list wants to show. */
-static const char* basename_of(const char* path) {
-    const char* last = path;
-    for (int at = 0; path[at]; at++)
-        if (path[at] == '\\') last = path + at + 1;
-    return last;
-}
-
-static void player_play(int index) {
-    long handle;
-    long size;
-    long got;
-    long affordable;
-    unsigned int data_at = 0;
-    unsigned int data_size;
-    const char* why;
-
-    if (index < 0 || index >= track_count) return;
-    player_stop();
-    player_message[0] = 0;
-
-    handle = koi_open(tracks[index], OPEN_READ);
-    if (handle < 0) {
-        koi_snprintf(player_message, sizeof(player_message),
-                     "Could not open %s", basename_of(tracks[index]));
-        return;
-    }
-
-    size = koi_filesize(handle);
-    /* KOI_INFO_MEMORY_FREE is in KiB. Half of it, so that playing something
-       long does not leave the machine with nothing for anything else. */
-    affordable = koi_sysinfo(KOI_INFO_MEMORY_FREE, 0) / 2 * 1024;
-    if (size <= 0) {
-        koi_close(handle);
-        koi_snprintf(player_message, sizeof(player_message), "%s is empty",
-                     basename_of(tracks[index]));
-        return;
-    }
-    if (size > affordable) {
-        koi_close(handle);
-        /* Said with both numbers. "Out of memory" leaves somebody guessing
-           whether a slightly smaller file would have worked. */
-        koi_snprintf(player_message, sizeof(player_message),
-                     "%s is %ld KiB and only %ld KiB can be spared",
-                     basename_of(tracks[index]), size / 1024,
-                     affordable / 1024);
-        return;
-    }
-
-    track_data = koi_alloc(size);
-    if (!track_data) {
-        koi_close(handle);
-        koi_snprintf(player_message, sizeof(player_message),
-                     "No room for %ld KiB", size / 1024);
-        return;
-    }
-    got = koi_read(handle, track_data, size);
-    koi_close(handle);
-    if (got <= 0) { player_stop(); return; }
-
-    data_size = wav_parse((const unsigned char*)track_data, (unsigned int)got,
-                          &voice_format, &data_at, &why);
-    if (!data_size) {
-        player_stop();
-        koi_snprintf(player_message, sizeof(player_message), "%s: %s",
-                     basename_of(tracks[index]), why);
-        return;
-    }
-
-    track_data_at = data_at;
-    voice_frames = data_size /
-        (unsigned int)(voice_format.channels * (voice_format.bits / 8));
-    if (!voice_frames) {
-        player_stop();
-        koi_snprintf(player_message, sizeof(player_message),
-                     "%s has no samples in it", basename_of(tracks[index]));
-        return;
-    }
-
-    if (player_start_from(0) < 0) {
-        player_stop();
-        koi_snprintf(player_message, sizeof(player_message),
-                     "Every voice is busy");
-        return;
-    }
-    track_playing = index;
-}
-
-#define BAR_TOP 8
-#define BAR_HEIGHT 18
-#define LIST_TOP 56
-
-static void clock_text(char* out, koi_uint64 size, unsigned int frames,
-                       unsigned int rate) {
-    unsigned int seconds = rate ? frames / rate : 0;
-    koi_snprintf(out, size, "%u:%02u", seconds / 60, seconds % 60);
-}
-
-static void paint_player(WINDOW* window, int x, int y, int width, int height) {
-    char line[64];
-    char left[16];
-    char right[16];
-    unsigned int at = voice >= 0 ? koi_sound_where(voice)
-                                 : (player_paused ? player_paused_frame : 0);
-    int rows = (height - LIST_TOP) / WINDOW_CHAR_H;
-
-    (void)window;
-
-    /* The bar. Drawn even when nothing is playing, because a control that
-       appears only once it is useful is a control nobody finds. */
-    window_sunken(x + 8, y + BAR_TOP, width - 16, BAR_HEIGHT);
-    if ((voice >= 0 || player_paused) && voice_frames) {
-        int span = (int)((koi_uint64)(width - 18) * at / voice_frames);
-        koi_gfx_fill(x + 9, y + BAR_TOP + 1, span, BAR_HEIGHT - 2, window_accent);
-    }
-
-    clock_text(left, sizeof(left), at, voice_format.rate);
-    clock_text(right, sizeof(right), voice_frames, voice_format.rate);
-    /* A message where the name goes, when there is one. A player that does
-       nothing and says nothing is a player somebody thinks is broken. */
-    if (player_message[0]) {
-        window_label(x + 8, y + BAR_TOP + BAR_HEIGHT + 4, player_message,
-                     window_shadow);
-    } else {
-        koi_snprintf(line, sizeof(line), "%s / %s   %s", left, right,
-                     track_playing >= 0 ? basename_of(tracks[track_playing])
-                                        : "");
-        window_label(x + 8, y + BAR_TOP + BAR_HEIGHT + 4, line, window_text);
-    }
-
-    for (int index = 0; index < track_count && index < rows; index++) {
-        int row = y + LIST_TOP + index * WINDOW_CHAR_H;
-        if (index == track_playing) {
-            koi_gfx_fill(x + 4, row, width - 8, WINDOW_CHAR_H, window_accent);
-            window_label(x + 8, row, basename_of(tracks[index]),
-                         window_client_paper);
-        } else {
-            window_label(x + 8, row, basename_of(tracks[index]), window_text);
-        }
-    }
-    if (!track_count)
-        window_label(x + 8, y + LIST_TOP,
-                     "No .WAV files in \\, \\MUSIC or \\WAV.", window_shadow);
-}
-
-static void click_player(WINDOW* window, int x, int y, int clicks) {
-    int client_x, client_y, client_w, client_h;
-
-    (void)window;
-    (void)clicks;
-    window_client(player_window, &client_x, &client_y, &client_w, &client_h);
-    /* On the bar: seek. One click, not two - a bar is a place, and asking for
-       a place twice is not a different request. */
-    if (y >= BAR_TOP && y < BAR_TOP + BAR_HEIGHT) {
-        if ((voice >= 0 || player_paused) && voice_frames && client_w > 18) {
-            koi_uint64 frame = (koi_uint64)(x - 9) * voice_frames /
-                               (koi_uint64)(client_w - 18);
-            if (x < 9) frame = 0;
-            if (frame >= voice_frames) frame = voice_frames - 1;
-            if (voice >= 0) koi_sound_seek(voice, (unsigned int)frame);
-            else player_paused_frame = (unsigned int)frame;
-            window_repaint();
-        }
-        return;
-    }
-
-    if (y >= LIST_TOP) {
-        int index = (y - LIST_TOP) / WINDOW_CHAR_H;
-        if (index >= 0 && index < track_count) {
-            player_play(index);
-            window_repaint();
-        }
-    }
-}
-
 /* ---- About --------------------------------------------------------------- */
 
 static void paint_about(WINDOW* window, int x, int y, int width, int height) {
@@ -948,56 +863,6 @@ static void open_clock(void) {
     clock_window->repaint_ms = 1000;   /* a clock that does not tick is a date */
 }
 
-static void name_note_menus(WINDOW_MENU* menus) {
-    menus[0] = (WINDOW_MENU){ say(SAY_MENU_FILE),
-        { { say(SAY_SAVE), MENU_SAVE }, { 0, 0 },
-          { say(SAY_CLOSE), MENU_EXIT } }, 3 };
-    menus[1] = (WINDOW_MENU){ say(SAY_MENU_FORMAT),
-        { { say(SAY_BOLD), MENU_BOLD }, { say(SAY_ITALIC), MENU_ITALIC },
-          { say(SAY_UNDERLINE), MENU_UNDERLINE }, { 0, 0 },
-          { say(SAY_PLAIN), MENU_PLAIN } }, 5 };
-}
-
-static void open_note(void) {
-    WINDOW_MENU menus[2];
-
-    if (note_window) { note_window->minimised = 0; window_raise(note_window); return; }
-    if (!note_ready) {
-        if (!edit_load(&note, NOTE_PATH, NOTE_CAPACITY) &&
-            !edit_new(&note, NOTE_CAPACITY)) return;
-        if (!note.path[0]) strcpy(note.path, NOTE_PATH);
-        note_ready = 1;
-    }
-    name_note_menus(menus);
-    note_window = window_new("NoteEdit - NOTE.TXT", 300, 120, 520, 340);
-    if (!note_window) return;
-    note_window->paint = paint_note;
-    note_window->key = key_note;
-    note_window->menu_count = 2;
-    note_window->menus[0] = menus[0];
-    note_window->menus[1] = menus[1];
-}
-
-static void open_player(void) {
-    static const WINDOW_MENU menus[] = {
-        { "File", { { "Pause", MENU_PAUSE }, { "Stop", MENU_STOP }, { 0, 0 }, { "Close", MENU_EXIT } }, 4 }
-    };
-
-    if (player_window) { player_window->minimised = 0; window_raise(player_window); return; }
-    player_scan();
-    player_window = window_new("Player", 340, 200, 400, 300);
-    if (!player_window) return;
-    player_window->paint = paint_player;
-    /* Four times a second: fast enough that the bar moves smoothly and slow
-       enough that a desktop with a track playing is not repainting itself
-       thirty times a second to move two pixels. */
-    player_window->repaint_ms = 250;
-    player_window->click = click_player;
-    player_window->menu_count = 1;
-    player_window->menus[0] = menus[0];
-    player_sync_pause_label();
-}
-
 static void open_about(void) {
     if (about_window) { about_window->minimised = 0; window_raise(about_window); return; }
     about_window = window_new(say(SAY_ABOUT), 360, 380, 480, 180);
@@ -1031,6 +896,13 @@ int main(void) {
        way the console editor does. The kernel takes it back when Mizu exits,
        so the prompt underneath is left typing ASCII. */
     koi_layout_gesture(1);
+    /* Ctrl+C is a keystroke here, not an execution.
+     *
+     * The kernel's rule is right for a command and wrong for a desktop: a
+     * shell is a program, so Ctrl+C closed every window and dropped whoever
+     * pressed it back at the prompt. It is put back the moment this exits, so
+     * the prompt underneath keeps its Ctrl+C. */
+    koi_break(0);
     WINDOW_EVENT event;
     WINDOW_MENU desktop[3];
     WINDOW_MENU panel[2];
@@ -1068,12 +940,13 @@ int main(void) {
     }
     /* Built here rather than written as literals: a menu in three languages
        is three tables that drift apart, and one table filled in at startup is
-       one. */
+       one. Built again when the language changes - see relabel(). */
     desktop[0] = (WINDOW_MENU){ say(SAY_MENU_SYSTEM),
         { { say(SAY_ABOUT), MENU_ABOUT }, { 0, 0 }, { say(SAY_EXIT), MENU_EXIT } }, 3 };
     desktop[1] = (WINDOW_MENU){ say(SAY_MENU_RUN),
-        { { say(SAY_NOTEEDIT), MENU_NOTE }, { "Player", MENU_PLAYER },
-          { say(SAY_COMMANDER), MENU_COMMANDER } }, 3 };
+        { { say(SAY_FILES), MENU_FILES }, { say(SAY_NOTEEDIT), MENU_NOTE },
+          { "Player", MENU_PLAYER }, { "Koi-DOS", MENU_TERM },
+          { say(SAY_COMMANDER), MENU_COMMANDER } }, 5 };
     desktop[2] = (WINDOW_MENU){ say(SAY_MENU_VIEW),
         { { say(SAY_CONTROL_PANEL), MENU_CONTROL },
           { say(SAY_CLOCK), MENU_CLOCK }, { 0, 0 },
@@ -1086,6 +959,7 @@ int main(void) {
 
     window_desktop_menu(desktop, 3);
     window_launcher(say(SAY_START));
+    remember_labels(desktop, panel);
 
     name_entries();
     control_window = window_new(say(SAY_CONTROL_PANEL), 60, 70, 512, 300);
@@ -1105,26 +979,22 @@ int main(void) {
             continue;
         }
         if (event.type == WINDOW_EVENT_MENU) {
+            /* A choice made in an application's own window belongs to that
+               application, whatever the number means. Mizu does not have a
+               table of its ids and must not grow one - that is the difference
+               between an application and a part of the shell. */
+            APPLICATION* owner = application_of(event.window);
+
+            if (owner && owner->app->menu) {
+                owner->app->menu(event.window, event.id);
+                continue;
+            }
             switch (event.id) {
             case MENU_ABOUT: open_about(); break;
-            case MENU_NOTE: open_note(); break;
-            case MENU_PLAYER: open_player(); break;
-            case MENU_PAUSE: player_toggle_pause(); window_repaint(); break;
-            case MENU_STOP: player_stop(); window_repaint(); break;
-            case MENU_SAVE:
-                if (note_ready) {
-                    strcpy(note_window->title, edit_save(&note, note.path)
-                           ? "NoteEdit - NOTE.TXT" : say(SAY_COULD_NOT_SAVE));
-                    window_repaint();
-                }
-                break;
-            case MENU_BOLD: note_style ^= KOI_TEXT_BOLD; window_repaint(); break;
-            case MENU_ITALIC: note_style ^= KOI_TEXT_ITALIC; window_repaint(); break;
-            case MENU_UNDERLINE:
-                note_style ^= KOI_TEXT_UNDERLINE;
-                window_repaint();
-                break;
-            case MENU_PLAIN: note_style = 0; window_repaint(); break;
+            case MENU_FILES: open_application(FILES); break;
+            case MENU_TERM: open_application(TERM); break;
+            case MENU_NOTE: open_application(NOTEEDIT); break;
+            case MENU_PLAYER: open_application(PLAYER); break;
             case MENU_CLOCK: open_clock(); break;
             case MENU_COMMANDER: start_commander(); break;
             case MENU_CONTROL:
@@ -1137,16 +1007,7 @@ int main(void) {
             case MENU_EXIT:
                 /* "Close" in a window's own File menu closes that window;
                    "Exit to DOS" in the desktop's menu ends everything. */
-                if (player_window && event.window == player_window) {
-                    player_stop();
-                    window_delete(player_window);
-                    player_window = (WINDOW*)0;
-                } else if (note_window && event.window == note_window) {
-                    window_delete(note_window);
-                    note_window = (WINDOW*)0;
-                } else {
-                    window_quit();
-                }
+                window_quit();
                 break;
             default: break;
             }
