@@ -133,6 +133,35 @@ static inline long koi_readline(char* buffer, long size) {
     return koi_call(SYS_READLINE, (long)buffer, size, 0);
 }
 
+/* Let Alt+Shift switch to the machine's other keyboard layout while this
+ * program runs. Off at the prompt and off again the moment the program exits -
+ * a shell whose commands are ASCII should not be able to start typing Cyrillic
+ * because somebody's fingers brushed two modifiers.
+ *
+ * For programs that take text in a language: an editor, a notepad. Not for one
+ * that takes a file name. */
+static inline void koi_layout_gesture(int enabled) {
+    (void)koi_call(SYS_LAYOUT_GESTURE, enabled, 0, 0);
+}
+
+
+/* The environment, as the shell has it. Returns the length, or 0 when there is
+ * no such variable - so `koi_getenv("PATH", ...)` both fetches it and answers
+ * whether it is set.
+ *
+ * Read-only, deliberately: there is one environment because there is one
+ * program running at a time, and a program that wrote it would be changing the
+ * shell's for good. */
+static inline long koi_getenv(const char* name, char* buffer, long size) {
+    return koi_call(SYS_GETENV, (long)name, (long)buffer, size);
+}
+
+/* The name of the index-th variable, for listing them. Returns 0 when there
+   are no more. */
+static inline long koi_env_at(long index, char* name, long size) {
+    return koi_call(SYS_ENVAT, index, (long)name, size);
+}
+
 static inline void koi_cls(void) {
     koi_call(SYS_CLS, 0, 0, 0);
 }
@@ -272,6 +301,42 @@ static inline long koi_systext(long item, long index, char* buffer, long size) {
     return koi_call4(SYS_SYSTEXT, item, index, (long)buffer, size);
 }
 
+/* Where this program's own files are.
+ *
+ * A package installs into a directory of its own and keeps its data there:
+ * DOOM and its WAD, Mizu and its wallpaper. The current directory is the
+ * user's - it is wherever they were standing when they typed the name - and
+ * once a package is on the search path, that is somewhere else entirely. A
+ * program that opens "DOOM.WAD" and expects to find its own copy is asking the
+ * wrong directory, and one that opens "\\MIZU\\WALLPAPER.BMP" has guessed
+ * where it was installed, which is the same mistake spelled confidently.
+ *
+ * So: ask. The kernel knows the path it loaded, and everything beside the
+ * program is one join away from it.
+ *
+ * `koi_beside` writes the full path to a file that ships with the program.
+ * Returns its length, or 0 when it will not fit. A program loaded from the
+ * root gets the name back unchanged, which is correct there. */
+static inline long koi_beside(const char* name, char* buffer, long size) {
+    long cut = 0;
+    long length = 0;
+
+    if (!name || !buffer || size <= 0) return 0;
+    if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, buffer, size) <= 0) buffer[0] = 0;
+
+    /* Everything up to and including the last backslash is the directory. */
+    for (long index = 0; buffer[index]; index++)
+        if (buffer[index] == '\\') cut = index + 1;
+    length = cut;
+
+    for (long index = 0; name[index]; index++) {
+        if (length + 1 >= size) { buffer[0] = 0; return 0; }
+        buffer[length++] = name[index];
+    }
+    buffer[length] = 0;
+    return length;
+}
+
 /* ---- Graphics ------------------------------------------------------------
  *
  * The shape of a graphics program:
@@ -341,6 +406,15 @@ static inline void koi_gfx_fill(int x, int y, int width, int height,
                                 koi_uint32 color) {
     (void)koi_call(SYS_GFX_FILL, KOI_POINT(x, y), KOI_POINT(width, height),
                    (long)color);
+}
+
+/* Darken what is already drawn in this rectangle. `keep` is how much of the
+   light survives out of 256, so 128 halves it and 0 goes to black. This is
+   what puts a modal dialogue in front of a screen rather than merely on top
+   of it: everything behind it visibly stops being where the work is. */
+static inline void koi_gfx_dim(int x, int y, int width, int height, int keep) {
+    (void)koi_call(SYS_GFX_DIM, KOI_POINT(x, y), KOI_POINT(width, height),
+                   (long)keep);
 }
 
 /* Text in the system font at pixel coordinates. Pass KOI_TEXT_TRANSPARENT as

@@ -155,6 +155,219 @@ static void paint_control(WINDOW* window, int x, int y, int width, int height) {
     }
 }
 
+/* ---- The Start menu ------------------------------------------------------
+ *
+ * What is in it is not written down here. Every package dosget installs leaves
+ * \BOOT\DOSGET\<NAME>.PKG naming its directory and the files it put there,
+ * so the menu is a reading of what this machine actually has: a package
+ * installed after Mizu was built appears without Mizu knowing anything about
+ * it. That record exists for the installer's sake; this is its second reader.
+ *
+ * The identifiers below sit above the built-in menu ids so one switch can
+ * carry both.
+ */
+#define START_FIRST_PROGRAM 100
+#define START_MAX_PROGRAMS 12
+#define START_SETTINGS 90
+#define START_SHUTDOWN 91
+
+typedef struct {
+    char label[32];      /* what to show: the package's name */
+    char command[96];    /* what to run: its directory and its program */
+} START_PROGRAM;
+
+static START_PROGRAM start_programs[START_MAX_PROGRAMS];
+static int start_program_count;
+
+/* Does `text` end with `suffix`, ignoring case? Used to keep a package's
+   first-run questions off the Programs menu. */
+static int ends_with_ignoring_case(const char* text, const char* suffix) {
+    long length = 0, tail = 0;
+
+    while (text[length]) length++;
+    while (suffix[tail]) tail++;
+    if (tail > length) return 0;
+    for (long index = 0; index < tail; index++) {
+        char a = text[length - tail + index];
+        char b = suffix[index];
+        if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+        if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+/* One .PKG record: the directory it names, and the first .EXE in it that is
+   not a configuration program. A package whose only executable is its own
+   first-run questions is not something to offer on a menu. */
+static int read_package(const char* record, START_PROGRAM* into) {
+    char text[1024];
+    long handle = koi_open(record, OPEN_READ);
+    long got;
+    char directory[64];
+    char program[64];
+
+    if (handle < 0) return 0;
+    got = koi_read(handle, text, sizeof(text) - 1);
+    koi_close(handle);
+    if (got <= 0) return 0;
+    text[got] = 0;
+
+    directory[0] = 0;
+    program[0] = 0;
+
+    for (long at = 0; at < got; ) {
+        char line[128];
+        long length = 0;
+        const char* value;
+
+        while (at < got && text[at] != '\n' && length + 1 < (long)sizeof(line))
+            line[length++] = text[at++];
+        while (at < got && text[at] != '\n') at++;
+        if (at < got) at++;
+        while (length && (line[length - 1] == '\r' || line[length - 1] == ' '))
+            length--;
+        line[length] = 0;
+
+        value = line;
+        while (*value && *value != '=') value++;
+        if (!*value) continue;
+        value++;
+        while (*value == ' ') value++;
+
+        if (line[0] == 'd' || line[0] == 'D') {
+            long copied = 0;
+            while (value[copied] && copied + 1 < (long)sizeof(directory))
+                { directory[copied] = value[copied]; copied++; }
+            directory[copied] = 0;
+        } else if ((line[0] == 'f' || line[0] == 'F') && !program[0]) {
+            long copied = 0;
+            /* .EXE only, and not the package's configuration program: CMDRCFG
+               and MIZUCFG are asked for from Settings, not from Programs. */
+            while (value[copied] && copied + 1 < (long)sizeof(program))
+                { program[copied] = value[copied]; copied++; }
+            program[copied] = 0;
+            if (copied < 5 || program[copied - 4] != '.') program[0] = 0;
+            else if (ends_with_ignoring_case(program, "CFG.EXE")) program[0] = 0;
+            else if (!ends_with_ignoring_case(program, ".EXE")) program[0] = 0;
+        }
+    }
+
+    if (!directory[0] || !program[0]) return 0;
+
+    {
+        /* The label is the directory without its backslash - the package's
+           name, which is what somebody would call it. */
+        const char* name = directory;
+        long copied = 0;
+        while (*name == '\\') name++;
+        while (name[copied] && copied + 1 < (long)sizeof(into->label))
+            { into->label[copied] = name[copied]; copied++; }
+        into->label[copied] = 0;
+    }
+    koi_snprintf(into->command, sizeof(into->command), "%s\\%s", directory,
+                 program);
+    return 1;
+}
+
+static void find_programs(void) {
+    KOI_FIND_DATA found;
+    long search;
+
+    start_program_count = 0;
+    search = koi_findfirst("\\BOOT\\DOSGET\\*.PKG", &found);
+    while (search >= 0 && start_program_count < START_MAX_PROGRAMS) {
+        char record[128];
+
+        koi_snprintf(record, sizeof(record), "\\BOOT\\DOSGET\\%s", found.name);
+        if (read_package(record, &start_programs[start_program_count]))
+            start_program_count++;
+        /* Zero is success here, not failure: the call answers "did this
+           work" the way a system call does, not "is there another" the way an
+           iterator would. Written the other way round, the loop stopped on the
+           first record it found and the menu listed exactly one package. */
+        if (koi_findnext(search, &found) != 0) break;
+    }
+    if (search >= 0) koi_findclose(search);
+}
+
+/* Open the Start menu, and do what was chosen.
+ *
+ * Programs are listed straight rather than in a submenu: with a handful of
+ * packages a submenu is a second click for nothing, and when there are enough
+ * to need one this is where it goes. */
+static void start_menu(void) {
+    WINDOW_ITEM items[WINDOW_ITEM_MAX];
+    int count = 0;
+    int chosen;
+    int anchor_x, anchor_y;
+
+    find_programs();
+
+    for (int index = 0; index < start_program_count &&
+                        count < WINDOW_ITEM_MAX - 4; index++) {
+        items[count].label = start_programs[index].label;
+        items[count].id = START_FIRST_PROGRAM + index;
+        count++;
+    }
+    if (!start_program_count) {
+        items[count].label = say(SAY_NO_PROGRAMS);
+        items[count].id = -1;
+        count++;
+    }
+    items[count].label = 0;          /* a line */
+    items[count].id = 0;
+    count++;
+    items[count].label = say(SAY_SETTINGS);
+    items[count].id = START_SETTINGS;
+    count++;
+    items[count].label = say(SAY_SHUT_DOWN);
+    items[count].id = START_SHUTDOWN;
+    count++;
+
+    window_launcher_anchor(&anchor_x, &anchor_y);
+    window_launcher_pressed(1);
+    chosen = window_popup(items, count, anchor_x, anchor_y);
+    window_launcher_pressed(0);
+    window_repaint();
+
+    if (chosen == START_SHUTDOWN) {
+        /* Asked in the middle of the screen with everything behind it dimmed,
+           and starting on Cancel. A Start menu whose bottom entry turns the
+           machine off without asking is one people learn to fear - and a
+           question asked in the corner the menu was just in is one that gets
+           the answer meant for the menu. */
+        chosen = window_confirm(say(SAY_SHUT_DOWN), say(SAY_SHUT_DOWN_ASK),
+                                say(DIALOG_OK), say(DIALOG_CANCEL), 0);
+        window_repaint();
+        if (chosen == 1) {
+            /* SYS_RUN executes a command line through the shell, built-in
+               commands included, so this is the same `shutdown` a person
+               would type - ACPI, and the kernel's own fallback behind it. */
+            koi_gfx_leave();
+            koi_run("shutdown");
+        }
+        return;
+    }
+    if (chosen == START_SETTINGS) {
+        if (control_window) {
+            control_window->minimised = 0;
+            window_raise(control_window);
+        }
+        return;
+    }
+    if (chosen >= START_FIRST_PROGRAM &&
+        chosen < START_FIRST_PROGRAM + start_program_count) {
+        /* The desktop goes away while it runs and comes back afterwards. That
+           is what SYS_RUN is - the caller is stopped inside the call - and it
+           is how Windows 3.0 ran a DOS program too. Until an application can
+           draw into a window, this is the honest shape. */
+        koi_gfx_leave();
+        koi_run(start_programs[chosen - START_FIRST_PROGRAM].command);
+        if (window_reopen_desktop()) window_repaint();
+    }
+}
+
 static void open_about(void);
 static void open_clock(void);
 static void open_note(void);
@@ -786,6 +999,10 @@ static void start_commander(void) {
 }
 
 int main(void) {
+    /* The desktop has a notepad in it, so it asks for the layout gesture the
+       way the console editor does. The kernel takes it back when Mizu exits,
+       so the prompt underneath is left typing ASCII. */
+    koi_layout_gesture(1);
     WINDOW_EVENT event;
     WINDOW_MENU desktop[3];
     WINDOW_MENU panel[2];
@@ -840,6 +1057,7 @@ int main(void) {
         { { say(SAY_ABOUT), MENU_ABOUT } }, 1 };
 
     window_desktop_menu(desktop, 3);
+    window_launcher(say(SAY_START));
 
     name_entries();
     control_window = window_new(say(SAY_CONTROL_PANEL), 60, 70, 512, 300);
@@ -916,6 +1134,7 @@ int main(void) {
          * On the control panel it does nothing, because the control panel is
          * the desktop: closing it is leaving, and leaving is the thing Escape
          * must not do by accident. */
+        if (event.type == WINDOW_EVENT_LAUNCHER) { start_menu(); continue; }
         if (event.type == WINDOW_EVENT_KEY && event.id == 27) {
             WINDOW* front = window_active();
 

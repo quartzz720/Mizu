@@ -1,0 +1,6 @@
+# Built by build.sh from the sources beside them. They were committed once,
+# which is how a repository ends up serving programs nobody can tell the age
+# of: dosget builds and publishes from source, so a binary here is a second
+# copy that goes stale in silence.
+MIZU.EXE
+MIZUCFG.EXE

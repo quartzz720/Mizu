@@ -35,7 +35,16 @@
  * it is the point at which it stopped needing a USB stick to be changed. A
  * machine that updates itself over the network is a different thing to live
  * with than one that does not, and that is what beta means here. */
-#define KOI_DOS_VERSION 0x0033
+#define KOI_DOS_VERSION 0x005A
+
+/* What to call it, in words. 0x005A is 0.90 and reads as "0.9"; the number is
+ * what orders correctly - 0.9 encoded as nine would sort below the 0.51 it
+ * follows - and the string is what people see.
+ *
+ * One definition rather than a literal in the shell and another in dosfetch,
+ * which is how a machine came to describe itself as Beta on one screen and
+ * Alpha on the next. Programs read it through KOI_TEXT_VERSION_NAME. */
+#define KOI_VERSION_NAME "0.9 Pre-release"
 
 /* The interface's own version, which moves independently of the system's.
  *
@@ -67,7 +76,9 @@
  * nothing else, so raising it would refuse every program already installed on a
  * machine until each was reinstalled. A rule worth keeping is worth keeping for
  * its reason, and the reason does not apply here. */
-#define KOI_ABI_VERSION 13
+/* 15 adds SYS_GFX_DIM, which reuses nothing: the minimum stays where it is,
+   for the reason written above. */
+#define KOI_ABI_VERSION 15
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -80,6 +91,16 @@ typedef struct {
     unsigned int abi_version;
     unsigned int reserved[2];
 } KOI_PROGRAM_HEADER;
+
+/* The exit code of a program that was stopped with Ctrl+C rather than one that
+ * finished. 130 is what the unix world uses for it - 128 plus the signal
+ * number - and borrowing a number somebody else has already agreed on beats
+ * inventing one that only means something here.
+ *
+ * A program never returns this itself; the kernel supplies it. A batch file
+ * can therefore tell "the command failed" from "somebody stopped it", which
+ * are different things to carry on from. */
+#define KOI_EXIT_INTERRUPTED 130
 
 /* Console and process. */
 #define SYS_EXIT 0x00        /* (code) - does not return */
@@ -143,6 +164,15 @@ typedef struct {
 #define KOI_KEY_CONTROL 0x10B
 #define KOI_KEY_ALT 0x10C
 #define KOI_KEY_F1 0x110     /* F1..F12 are consecutive from here */
+
+/* Ctrl+Escape, which is what Windows put its Start menu on and what a lot of
+ * fingers already know.
+ *
+ * A code of its own because Escape with Control held is otherwise
+ * indistinguishable from Escape: Ctrl only changes letters, and 27 is not a
+ * letter. Without this the gesture arrives as a plain Escape, which every
+ * program reads as "close this". */
+#define KOI_KEY_MENU 0x11D
 
 /* Set in a SYS_KEYEVENT result when the key came up rather than went down. */
 #define KOI_KEY_RELEASED 0x8000
@@ -336,6 +366,10 @@ typedef struct {
  * happened to be right. */
 #define KOI_TEXT_PROGRAM_PATH 6
 
+/* The version in words - "0.9 Pre-release" - so a program prints what the
+   system calls itself rather than its own guess at it. */
+#define KOI_TEXT_VERSION_NAME 7
+
 /* Graphics.
  *
  * A program takes the screen, draws, shows the result, and gives the screen
@@ -373,6 +407,11 @@ typedef struct {
 #define SYS_GFX_TEXT_STYLED 0x3B   /* (point, text, colour, packed) */
 #define SYS_GFX_SCISSOR 0x3C       /* (point, size) - intersect clip rect */
 #define SYS_GFX_SCISSOR_RESET 0x3D /* () - restore full-screen clipping */
+/* (point, size, how much light survives out of 256). Darkens what is already
+   drawn instead of painting over it - the one operation that reads the buffer
+   back, which is why it is a call and not a loop in the caller: a program
+   doing it itself would need two calls per pixel. */
+#define SYS_GFX_DIM 0x3E           /* (point, size, keep) */
 
 #define KOI_TEXT_BOLD 1
 #define KOI_TEXT_ITALIC 2
@@ -526,6 +565,31 @@ typedef struct {
  * nothing here does that for it, because a program that only wants to run
  * `dir` should not have its window torn down. */
 #define SYS_RUN 0x59         /* (command) -> the program's exit code, or -1 */
+
+/* The environment, as the shell has it.
+ *
+ * Read-only from a program, and that is a decision rather than an omission.
+ * There is one environment because there is one program running at a time; a
+ * program that could write it would be changing the shell's, and the change
+ * would outlive the program that made it. DOS gave each program a copy for
+ * exactly that reason, and copies are what this will get when programs are
+ * isolated - at which point a setter can be added and will mean something.
+ *
+ * SYS_GETENV fills `buffer` with the value and returns its length, or 0 when
+ * there is no such variable. SYS_ENVAT is how a program lists them: it takes
+ * an index from zero and fills `name`, returning 0 when the index is past the
+ * end. */
+/* Turn the Alt+Shift layout gesture on for as long as this program runs.
+ *
+ * Off everywhere else, because the shell is ASCII and a stray Alt+Shift there
+ * is a keyboard that has quietly stopped obeying. A program that takes text in
+ * somebody's own language - an editor, a notepad - asks for it; the kernel
+ * turns it off again when the program exits, so forgetting to is not a way to
+ * leave the machine odd. */
+#define SYS_LAYOUT_GESTURE 0x5C  /* (enabled) -> 0 */
+
+#define SYS_GETENV 0x5A      /* (name, buffer, size) -> length, or 0 */
+#define SYS_ENVAT 0x5B       /* (index, name, size) -> length, or 0 */
 
 #define KOI_BUTTON_LEFT 0x01
 #define KOI_BUTTON_RIGHT 0x02
