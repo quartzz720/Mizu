@@ -170,6 +170,7 @@ static void paint_control(WINDOW* window, int x, int y, int width, int height) {
 #define START_MAX_PROGRAMS 12
 #define START_SETTINGS 90
 #define START_SHUTDOWN 91
+#define START_RUN 92
 
 typedef struct {
     char label[32];      /* what to show: the package's name */
@@ -318,6 +319,9 @@ static void start_menu(void) {
     items[count].label = 0;          /* a line */
     items[count].id = 0;
     count++;
+    items[count].label = say(SAY_RUN);
+    items[count].id = START_RUN;
+    count++;
     items[count].label = say(SAY_SETTINGS);
     items[count].id = START_SETTINGS;
     count++;
@@ -347,6 +351,30 @@ static void start_menu(void) {
             koi_gfx_leave();
             koi_run("shutdown");
         }
+        return;
+    }
+    if (chosen == START_RUN) {
+        /* Whatever the shell can run: a program, or a command like `dir` that
+           only exists inside it. Mizu does not look at what was typed and
+           does not need to - SYS_RUN hands the line to COMMAND, which is the
+           one place that knows what a command line means. What comes back is
+           the exit code, and KOI_EXIT_NOT_FOUND is the shell's "there is no
+           such command"; anything
+           else, including a program that failed for its own reasons, is the
+           program's business and not a thing to put a box in front of. */
+        static char line[96];
+        long code;
+
+        if (!window_prompt(say(SAY_RUN), say(SAY_RUN_ASK), say(DIALOG_OK),
+                           say(DIALOG_CANCEL), line, sizeof(line))) {
+            window_repaint();
+            return;
+        }
+        koi_gfx_leave();
+        code = koi_run(line);
+        if (window_reopen_desktop()) window_repaint();
+        if (code == KOI_EXIT_NOT_FOUND)
+            window_message(say(SAY_RUN), say(SAY_RUN_FAILED), say(DIALOG_OK));
         return;
     }
     if (chosen == START_SETTINGS) {
