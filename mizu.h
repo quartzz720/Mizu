@@ -51,10 +51,22 @@
  */
 
 /* 2 adds `yield`, 3 adds `run`, 4 adds `open_with` to MIZU_APP and
-   `open_file` to the table, 5 adds the language. An application that needs one
-   of them says so by refusing anything older, which is what the version is
-   for. */
-#define MIZU_API_VERSION 5
+   `open_file` to the table, 5 adds the language.
+ *
+ * 6 adds `context` to WINDOW - the right button - and icons a window may
+ * draw. 7 adds `context_menu`, so an application can open one of its own.
+ *
+ * Both went on the end of the structure they belong to rather than beside the
+ * thing they belong with, and that is not tidiness: applications are
+ * handed pointers to windows this desktop allocated, so a field inserted in
+ * the middle would move every field after it and an application built against
+ * 5 would write to the wrong one. On the end, an older application simply
+ * never sets it and the right button does nothing in its windows, which is
+ * exactly what it should do. */
+/* 8 adds the scrollbar: three calls, on the end like everything else. An
+   application built against 7 never asks for one and has the arrow keys it
+   always had. */
+#define MIZU_API_VERSION 8
 
 /* Which colour, since the theme lives in window.c's own variables and an
    application cannot see them. Asked for by name so that a theme that changes
@@ -96,6 +108,7 @@ typedef struct {
     int (*message)(const char* title, const char* message, const char* accept);
     int (*prompt)(const char* title, const char* message, const char* accept,
                   const char* cancel, char* buffer, int size);
+
 
     /* The phrase table, so an application speaks the language the machine is
        set to without carrying its own copy of the settings. */
@@ -147,6 +160,37 @@ typedef struct {
     int (*language_count)(void);
     const char* (*language_name)(int which);
     void (*language_set)(int which);
+
+    /* A menu at the pointer, for the right button.
+     *
+     * The same one the Start button uses, opening downwards from where it is
+     * told rather than upwards. An application gets this rather than reaching
+     * into the library, because the library is not linked into an application:
+     * the table is the whole interface, and everything an application may do
+     * is visible in it.
+     *
+     * On the end, like every addition to this table. An application built
+     * against an older version reads the fields before it at the offsets it
+     * was compiled with, which is the only reason adding one is safe at all. */
+    int (*context_menu)(const WINDOW_ITEM* items, int count, int x, int y);
+
+    /* A scrollbar, for contents longer than the window.
+     *
+     * Here rather than drawn by each application for the reason the whole
+     * table exists: three applications drawing their own is three thumbs that
+     * sit a pixel apart and three sets of hit rules to get wrong. The caller
+     * counts in its own items - lines, files, rows - and says how many there
+     * are, how many fit, and which is first.
+     *
+     * `scrollbar_press` answers a press: the arrows step, the trough pages,
+     * the thumb waits for the drag. `scrollbar_drag` answers the pointer
+     * moving with the button down. Both give back the new first item. */
+    void (*scrollbar)(int x, int y, int height, int top, int visible,
+                      int total);
+    int (*scrollbar_press)(int y, int height, int top, int visible, int total,
+                           int point_y);
+    int (*scrollbar_drag)(int y, int height, int visible, int total,
+                          int point_y);
 } MIZU_API;
 
 /* What an application hands back.

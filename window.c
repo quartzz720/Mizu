@@ -45,6 +45,9 @@ static int dirty = 1;
 
 /* An open drop-down: which bar it belongs to (0 the desktop, else a window),
    which menu, and where it was drawn so a click can be tested against it. */
+/* The window whose contents the current press landed in, for as long as that
+   press lasts. What makes dragging a selection possible. */
+static WINDOW* pressing;
 static WINDOW* menu_owner;
 static WINDOW* chosen_owner;
 static int menu_open = -1;
@@ -69,6 +72,13 @@ static const char* cursor_shape[CURSOR_H] = {
 
 static koi_uint32 cursor_under[CURSOR_H][CURSOR_W];
 static int cursor_x = -1, cursor_y = -1, cursor_saved;
+
+/* Where the pointer is, as of the last look.
+ *
+ * Declared here rather than beside the loop that fills it, because painting
+ * needs it now: a frame is drawn with the cursor already in it, and the thing
+ * doing the drawing has to know where that is. */
+static KOI_POINTER pointer;
 static koi_uint32 cursor_ink, cursor_edge;
 
 static koi_uint32* pixel_row(int y) {
@@ -217,6 +227,205 @@ static int load_wallpaper(void) {
     return 1;
 }
 
+/* ---- Icons ---------------------------------------------------------------
+ *
+ * A small BMP reader, separate from the wallpaper's on purpose. That one
+ * handles the several shapes a paint program may write a photograph in, and
+ * scales it to the screen; this one reads a 32x32 drawing that was made to a
+ * written-down specification, and anything not matching that specification is
+ * a drawing that needs fixing rather than a case to support.
+ *
+ * Twenty-four bits, uncompressed, bottom-up or top-down, at most 32x32. The
+ * key colour is magenta and is skipped when drawing. */
+#define ICON_CACHE 20
+
+typedef struct {
+    char name[20];
+    int width;
+    int height;
+    int failed;
+    koi_uint32 pixels[WINDOW_ICON_MAX_SIZE * WINDOW_ICON_MAX_SIZE];
+} ICON;
+
+static ICON icons[ICON_CACHE];
+static int icon_count;
+
+/* The colour that means "not there". Computed through koi_gfx_color rather
+   than written as a number, because the screen decides where the red goes. */
+static koi_uint32 icon_key(void) {
+    return koi_gfx_color(255, 0, 255);
+}
+
+static int icon_same_name(const char* a, const char* b) {
+    for (int at = 0; ; at++) {
+        char left = a[at];
+        char right = b[at];
+
+        if (left >= 'a' && left <= 'z') left = (char)(left - 32);
+        if (right >= 'a' && right <= 'z') right = (char)(right - 32);
+        if (left != right) return 0;
+        if (!left) return 1;
+    }
+}
+
+static int icon_read(ICON* icon, const char* name) {
+    koi_uint8 header[54];
+    koi_uint8 row_bytes[WINDOW_ICON_MAX_SIZE * 4 + 4];
+    char path[128];
+    long handle;
+    koi_uint32 data_offset;
+    koi_uint32 info_size;
+    long width;
+    long height;
+    int upside_down = 0;
+    long padded_row;
+    long skip;
+
+    /* Beside the program: the package is installed wherever dosget put it,
+     * and a written-down path would be right on exactly one machine.
+     *
+     * Beside it rather than in a directory under it, because a package is a
+     * flat list of files - that is what the manifest can express and what
+     * dosget installs - and a drawing that only appears when somebody copies
+     * it by hand is a drawing nobody sees. They are kept in ICONS/ in the
+     * source tree, where they are drawings; they arrive here as part of the
+     * package, where they are files. */
+    if (!koi_beside(name, path, sizeof(path))) return 0;
+
+    handle = koi_open(path, OPEN_READ);
+    if (handle < 0) return 0;
+    if (!read_exactly(handle, header, sizeof(header))) { koi_close(handle); return 0; }
+    if (header[0] != 'B' || header[1] != 'M') { koi_close(handle); return 0; }
+
+    data_offset = read32(header + 10);
+    info_size = read32(header + 14);
+    width = (long)(int)read32(header + 18);
+    height = (long)(int)read32(header + 22);
+    if (height < 0) { height = -height; upside_down = 1; }
+
+    /* 24 bits, uncompressed, and no larger than an icon. Everything else is a
+       file that does not match what ICONS.md asked for. */
+    if (read16(header + 28) != 24 || read32(header + 30) != 0) {
+        koi_close(handle);
+        return 0;
+    }
+    if (width < 1 || height < 1 ||
+        width > WINDOW_ICON_MAX_SIZE || height > WINDOW_ICON_MAX_SIZE) {
+        koi_close(handle);
+        return 0;
+    }
+    if (data_offset < 14 + info_size) { koi_close(handle); return 0; }
+
+    skip = (long)data_offset - (long)sizeof(header);
+    while (skip > 0) {
+        long chunk = skip < (long)sizeof(row_bytes) ? skip : (long)sizeof(row_bytes);
+        if (!read_exactly(handle, row_bytes, chunk)) { koi_close(handle); return 0; }
+        skip -= chunk;
+    }
+
+    padded_row = (width * 3 + 3) & ~3L;
+    for (long line = 0; line < height; line++) {
+        /* A BMP is stored bottom row first unless it says otherwise. */
+        long target = upside_down ? line : height - 1 - line;
+        koi_uint32* output = icon->pixels + target * width;
+
+        if (!read_exactly(handle, row_bytes, padded_row)) {
+            koi_close(handle);
+            return 0;
+        }
+        for (long x = 0; x < width; x++) {
+            const koi_uint8* pixel = row_bytes + x * 3;
+            output[x] = koi_gfx_color(pixel[2], pixel[1], pixel[0]);
+        }
+    }
+    koi_close(handle);
+
+    icon->width = (int)width;
+    icon->height = (int)height;
+    return 1;
+}
+
+int window_icon(const char* name) {
+    ICON* icon;
+
+    if (!name || !name[0]) return 0;
+    for (int index = 0; index < icon_count; index++)
+        if (icon_same_name(icons[index].name, name))
+            return icons[index].failed ? 0 : index + 1;
+
+    if (icon_count >= ICON_CACHE) return 0;
+    icon = &icons[icon_count];
+    {
+        int at = 0;
+        while (name[at] && at + 1 < (int)sizeof(icon->name)) {
+            icon->name[at] = name[at];
+            at++;
+        }
+        icon->name[at] = 0;
+    }
+    /* Remembered either way. A file that is not there is not there on the
+       next repaint either, and looking for it sixty times a second is a
+       desktop that spends its life asking the disk a question it has already
+       been answered. */
+    if (!icon_read(icon, name)) {
+        icon->failed = 1;
+        icon_count++;
+        return 0;
+    }
+    icon_count++;
+    return icon_count;
+}
+
+int window_icon_width(int icon) {
+    if (icon < 1 || icon > icon_count || icons[icon - 1].failed) return 0;
+    return icons[icon - 1].width;
+}
+
+int window_icon_height(int icon) {
+    if (icon < 1 || icon > icon_count || icons[icon - 1].failed) return 0;
+    return icons[icon - 1].height;
+}
+
+void window_icon_draw(int icon, int x, int y) {
+    const ICON* drawing;
+    koi_uint32 key = icon_key();
+
+    if (icon < 1 || icon > icon_count) return;
+    drawing = &icons[icon - 1];
+    if (drawing->failed) return;
+
+    for (int row = 0; row < drawing->height; row++) {
+        int py = y + row;
+        koi_uint32* line;
+
+        if (py < 0 || py >= (int)screen.height) continue;
+        line = pixel_row(py);
+        for (int column = 0; column < drawing->width; column++) {
+            int px = x + column;
+            koi_uint32 colour = drawing->pixels[row * drawing->width + column];
+
+            if (px < 0 || px >= (int)screen.width) continue;
+            if (colour == key) continue;
+            line[px] = colour;
+        }
+    }
+}
+
+/* Where the pointer was last erased from and not yet redrawn.
+ *
+ * It matters now that the machine has threads. Erasing used to be followed by
+ * redrawing within a few microseconds - nothing could happen in between - so
+ * erasing could hand the bare rectangle straight to the screen and nobody ever
+ * saw it. With the processor being taken away at any moment, that gap became a
+ * whole turn of the scheduler, and a frame with no pointer in it was on the
+ * screen for all of it. That is the flicker: not the pointer being drawn
+ * badly, but the pointer's absence being *shown*.
+ *
+ * So erasing no longer shows anything. The rectangle it cleaned is remembered,
+ * and the next thing that hands a frame over includes it - by which time the
+ * pointer is back in the picture. */
+static int erased_x, erased_y, erased_pending;
+
 static void cursor_hide(void) {
     if (!cursor_saved) return;
     for (int row = 0; row < CURSOR_H; row++) {
@@ -230,11 +439,22 @@ static void cursor_hide(void) {
             line[px] = cursor_under[row][col];
         }
     }
-    koi_gfx_present_rect(cursor_x, cursor_y, CURSOR_W, CURSOR_H);
+    erased_x = cursor_x;
+    erased_y = cursor_y;
+    erased_pending = 1;
     cursor_saved = 0;
 }
 
-static void cursor_show(int x, int y) {
+/* Draw the cursor into the buffer, without showing it.
+ *
+ * Split out because a frame must never be shown without it. Painting used to
+ * take the cursor away, draw everything, show the result, and only then put
+ * the cursor back with a second show - so every repaint put a frame on the
+ * screen with no pointer in it. At one repaint a second that is a pointer
+ * that blinks; at four, from a window with a progress bar, it is a pointer
+ * that flickers. Nothing was wrong with the drawing: the cursor was simply
+ * not in the picture at the moment the picture was handed over. */
+static void cursor_paint(int x, int y) {
     cursor_x = x;
     cursor_y = y;
     for (int row = 0; row < CURSOR_H; row++) {
@@ -253,7 +473,19 @@ static void cursor_show(int x, int y) {
         }
     }
     cursor_saved = 1;
+}
+
+/* And the same, shown at once: for the modal loops, which paint a small thing
+   and hand it over immediately. */
+static void cursor_show(int x, int y) {
+    cursor_paint(x, y);
     koi_gfx_present_rect(x, y, CURSOR_W, CURSOR_H);
+    /* And wherever it was before, if that has not been handed over yet -
+       otherwise the old picture of it stays on the screen as a ghost. */
+    if (erased_pending) {
+        koi_gfx_present_rect(erased_x, erased_y, CURSOR_W, CURSOR_H);
+        erased_pending = 0;
+    }
 }
 
 /* ---- Drawing ------------------------------------------------------------- */
@@ -322,11 +554,151 @@ void window_sunken(int x, int y, int width, int height) {
     bevel(x, y, width, height, window_shadow, window_light);
 }
 
+/* ---- The scrollbar -------------------------------------------------------
+ *
+ * Three applications had a list longer than their window and three different
+ * answers to it: the arrow keys, and nothing else. That works and is invisible
+ * - a window with more in it than fits looks exactly like a window with
+ * nothing more in it, and the only way to find out is to press a key on the
+ * chance.
+ *
+ * So it lives here rather than in any of them. A scrollbar is a shape, a
+ * proportion and a set of hit rules, and three copies of that is three places
+ * for the thumb to end up half a pixel different.
+ *
+ * The numbers are the caller's own: `total` items exist, `visible` of them fit
+ * and the first one on screen is `top`. Nothing here knows or cares whether an
+ * item is a line of text, a file or a wrapped line of a web page.
+ */
+
+static int thumb_span(int height, int visible, int total, int* out_top) {
+    int track = height - 2 * WINDOW_SCROLLBAR_W;
+    int span;
+    int position;
+
+    if (track < 8) track = 8;
+    if (total < 1) total = 1;
+    if (visible < 1) visible = 1;
+    if (visible >= total) { *out_top = 0; return track; }
+
+    span = track * visible / total;
+    /* Never smaller than something a pointer can catch. A thumb of two pixels
+       on a very long document is arithmetically right and useless. */
+    if (span < WINDOW_SCROLLBAR_W) span = WINDOW_SCROLLBAR_W;
+    if (span > track) span = track;
+
+    position = (track - span) * *out_top / (total - visible);
+    if (position < 0) position = 0;
+    if (position > track - span) position = track - span;
+    *out_top = position;
+    return span;
+}
+
+void window_scrollbar(int x, int y, int height, int top, int visible,
+                      int total) {
+    int arrow = WINDOW_SCROLLBAR_W;
+    int position = top;
+    int span;
+    int inactive = visible >= total || total < 1;
+
+    if (height < 3 * arrow) arrow = height / 3;
+    if (arrow < 4) return;
+
+    span = thumb_span(height, visible, total, &position);
+
+    /* The trough, which is the paper of the window darkened rather than a
+       colour of its own: a theme that changes takes this with it. */
+    koi_gfx_fill(x, y + arrow, WINDOW_SCROLLBAR_W, height - 2 * arrow,
+                 window_light);
+    bevel(x, y + arrow, WINDOW_SCROLLBAR_W, height - 2 * arrow,
+          window_shadow, window_face);
+
+    window_raised(x, y, WINDOW_SCROLLBAR_W, arrow);
+    window_raised(x, y + height - arrow, WINDOW_SCROLLBAR_W, arrow);
+    /* The same triangle the menus point with, which is why it is above this
+       and not beside it: one arrow in this library, two places that need
+       one. */
+    triangle(x + WINDOW_SCROLLBAR_W / 2 - 4, y + arrow / 2 - 2, 7, 4, 0,
+             inactive ? window_shadow : window_text);
+    triangle(x + WINDOW_SCROLLBAR_W / 2 - 4, y + height - arrow + arrow / 2 - 2,
+             7, 4, 1, inactive ? window_shadow : window_text);
+
+    /* With everything in view there is no thumb to drag - the bar stays,
+       because a bar that disappears makes the window jump a pixel wider
+       every time a list gets shorter. */
+    if (inactive) return;
+    window_raised(x, y + arrow + position, WINDOW_SCROLLBAR_W, span);
+}
+
+int window_scrollbar_press(int y, int height, int top, int visible, int total,
+                           int point_y) {
+    int arrow = WINDOW_SCROLLBAR_W;
+    int position = top;
+    int span;
+    int inside = point_y - y;
+
+    if (height < 3 * arrow) arrow = height / 3;
+    if (arrow < 4 || visible >= total) return top;
+    span = thumb_span(height, visible, total, &position);
+
+    if (inside < arrow) return top > 0 ? top - 1 : 0;
+    if (inside >= height - arrow)
+        return top + visible < total ? top + 1 : top;
+
+    inside -= arrow;
+    /* Above or below the thumb is a page in that direction, which is what
+       every system this looks like does and what a hand expects. */
+    if (inside < position) {
+        top -= visible;
+        return top < 0 ? 0 : top;
+    }
+    if (inside >= position + span) {
+        top += visible;
+        return top + visible > total ? total - visible : top;
+    }
+    return top;                     /* on the thumb: the drag does the work */
+}
+
+int window_scrollbar_drag(int y, int height, int visible, int total,
+                          int point_y) {
+    int arrow = WINDOW_SCROLLBAR_W;
+    int track;
+    int span;
+    int position = 0;
+    int top;
+
+    if (height < 3 * arrow) arrow = height / 3;
+    if (arrow < 4 || visible >= total || total < 1) return 0;
+
+    track = height - 2 * arrow;
+    span = thumb_span(height, visible, total, &position);
+    if (track <= span) return 0;
+
+    /* The thumb follows the pointer by its middle, so that grabbing it
+       anywhere does not make the document jump on the first pixel. */
+    position = point_y - y - arrow - span / 2;
+    if (position < 0) position = 0;
+    if (position > track - span) position = track - span;
+
+    top = position * (total - visible) / (track - span);
+    if (top < 0) top = 0;
+    if (top + visible > total) top = total - visible;
+    return top;
+}
+
 /* The desktop: a vertical wash from one water to another.
  *
  * Computed rather than loaded. A picture would be a file to ship, a format to
  * decode and a decision about what happens on a screen of a different size;
  * two colours and a division answer all three. */
+/* Whoever draws on the desktop, if anybody does. */
+static void (*desktop_painter)(void);
+
+void window_desktop_paint(void (*paint)(void)) {
+    desktop_painter = paint;
+    dirty = 1;
+}
+
 static void paint_desktop(void) {
     int top = WINDOW_TOPBAR_H;
     int bottom = (int)screen.height - WINDOW_TASKBAR_H;
@@ -608,11 +980,23 @@ void window_tile(void) {
 }
 
 void window_repaint(void) { dirty = 1; }
-void window_quit(void) { running = 0; }
+/* Why the desktop ended, said into the kernel's log.
+ *
+ * It ended silently, from any of three places, and the reports that came back
+ * were "it dropped out to DOS and the log is empty" - which is true and
+ * useless. Whatever else is wrong, the way out should always name itself. */
+void window_quit(void) {
+    koi_log("MIZU: asked to quit\n");
+    running = 0;
+}
 
 static void draw_everything(void) {
     cursor_hide();
     paint_desktop();
+    /* And whatever the desktop puts on it - icons, and nothing else so far.
+       After the wallpaper and before the windows, which is where things that
+       live on a desktop live. */
+    if (desktop_painter) desktop_painter();
 
     koi_gfx_fill(0, 0, (int)screen.width, WINDOW_TOPBAR_H, window_face);
     if (desktop_menu_count)
@@ -626,7 +1010,12 @@ static void draw_everything(void) {
 
     paint_taskbar();
     if (menu_open >= 0) paint_dropdown();
+    /* The cursor goes into the frame before the frame is shown, so what
+       reaches the screen is complete. */
+    cursor_paint(pointer.x, pointer.y);
     koi_gfx_present();
+    /* The whole screen just went over, so whatever was erased went with it. */
+    erased_pending = 0;
     dirty = 0;
 }
 
@@ -678,6 +1067,7 @@ void window_delete(WINDOW* window) {
     order_count = out;
     window->used = 0;
     if (menu_owner == window) { menu_owner = (WINDOW*)0; menu_open = -1; }
+    if (pressing == window) pressing = (WINDOW*)0;
     dirty = 1;
 }
 
@@ -747,7 +1137,14 @@ void window_launcher_pressed(int pressed) {
     dirty = 1;
 }
 
-int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
+/* Both shapes of menu, because they differ in one line.
+ *
+ * `grow_down` is what a context menu does - the pointer is at the top-left
+ * corner, the way every menu opened by the right button since 1995 has
+ * behaved. Without it the menu comes up above the pointer, which is right for
+ * the Start button at the bottom of the screen and wrong everywhere else. */
+static int popup_at(const WINDOW_ITEM* items, int count, int x, int y,
+                    int grow_down) {
     int width = 140;
     int height;
     int rows = 0;
@@ -756,6 +1153,8 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
     KOI_POINTER pointer;
     int was_down = 0;
     int opening;
+    int opening_x = 0;
+    int opening_y = 0;
 
     if (count > WINDOW_ITEM_MAX) count = WINDOW_ITEM_MAX;
     for (int index = 0; index < count; index++) {
@@ -768,8 +1167,12 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
     height = rows * (WINDOW_CHAR_H + 4) + 6;
 
     /* Upwards from the point given, and kept on the screen. The thing that
-       opens one of these is on the taskbar at the bottom. */
-    y -= height;
+       opens one of these is on the taskbar at the bottom - unless it grows
+       downwards, and then it flips back up when there is no room below,
+       because a menu half off the screen is a menu with entries nobody can
+       reach. */
+    if (!grow_down) y -= height;
+    else if (y + height > (int)screen.height) y -= height;
     if (y < 0) y = 0;
     if (x + width > (int)screen.width) x = (int)screen.width - width;
     if (x < 0) x = 0;
@@ -790,7 +1193,13 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
      * chooses that entry; letting it go anywhere else leaves the menu open
      * and everything after it behaves normally. */
     koi_mouse(&pointer);
-    opening = (pointer.buttons & KOI_BUTTON_LEFT) != 0;
+    /* Either button. A menu opened by the right one is worked with the right
+       one - hold, slide, release - and a menu that only answered the left
+       would be a menu people open and then cannot use without letting go and
+       starting again. */
+    opening = (pointer.buttons & (KOI_BUTTON_LEFT | KOI_BUTTON_RIGHT)) != 0;
+    opening_x = pointer.x;
+    opening_y = pointer.y;
 
     for (;;) {
         int highlight = -1;
@@ -828,13 +1237,27 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
         koi_gfx_present_rect(x, y, width, height);
         cursor_show(pointer.x, pointer.y);
 
-        if (pointer.buttons & KOI_BUTTON_LEFT) {
+        if (pointer.buttons & (KOI_BUTTON_LEFT | KOI_BUTTON_RIGHT)) {
             if (!opening) was_down = 1;
         } else if (opening) {
-            /* The click that opened the menu has ended. Over an entry that
-               was a press-and-drag choice; anywhere else the menu stays. */
+            /* The click that opened the menu has ended.
+             *
+             * It chooses only if the pointer went somewhere first. Letting go
+             * where the press happened is a plain click and leaves the menu
+             * standing; sliding onto an entry and letting go there is the
+             * other way of working a menu, and both are in people's hands.
+             *
+             * The distance is what makes this correct for a menu that grows
+             * downwards from the pointer. Such a menu opens with the pointer
+             * already on its first entry, so "released over an entry" is true
+             * the instant it appears - and the menu chose its top item and
+             * vanished the moment the button came up. Which is exactly what
+             * the right button did on the day it was added. */
+            int moved = (pointer.x - opening_x) * (pointer.x - opening_x) +
+                        (pointer.y - opening_y) * (pointer.y - opening_y) > 16;
+
             opening = 0;
-            if (highlight >= 0 && items[highlight].label) {
+            if (moved && highlight >= 0 && items[highlight].label) {
                 chosen = items[highlight].id;
                 break;
             }
@@ -878,6 +1301,14 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
     cursor_hide();
     dirty = 1;
     return chosen;
+}
+
+int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
+    return popup_at(items, count, x, y, 0);
+}
+
+int window_context(const WINDOW_ITEM* items, int count, int x, int y) {
+    return popup_at(items, count, x, y, 1);
 }
 
 /* ---- Modal questions ------------------------------------------------------
@@ -1234,6 +1665,7 @@ int window_reopen_desktop(void) {
 }
 
 void window_close_desktop(void) {
+    koi_log("MIZU: the desktop was closed\n");
     cursor_hide();
     koi_gfx_leave();
     running = 0;
@@ -1326,8 +1758,10 @@ static int take_menu_click(int x, int y) {
  * knows what to do with it. It goes in a queue and window_next takes it from
  * there. That queue is the message queue the plan asked for; it earned its
  * place by being needed rather than by being on a list. */
-static KOI_POINTER pointer;
 static unsigned int last_press;
+/* The right button's own count. It has been in the pointer's report since
+   there was a pointer and nothing has ever read it. */
+static unsigned int last_press_right;
 static int started;
 static koi_uint64 last_click_at;
 static int last_click_x = -100;
@@ -1370,6 +1804,72 @@ static void busy_leave(WINDOW* window) {
     if (window) window->busy = 0;
 }
 
+/* Redraw the windows that asked to be redrawn on a timer, in place.
+ *
+ * Only the ones nothing overlaps: a window with something on top of it cannot
+ * be painted in isolation without painting over what is above it, and working
+ * out what to repair costs more than repainting the screen. Those fall back to
+ * the full redraw, which is what every window used to get.
+ *
+ * The pointer is lifted only if it is over the window being painted, which is
+ * the other half of why this stopped blinking. */
+static int window_overlapped(int index) {
+    WINDOW* window = order[index];
+
+    for (int above = index + 1; above < order_count; above++) {
+        WINDOW* other = order[above];
+
+        if (other->minimised) continue;
+        if (other->x >= window->x + window->width) continue;
+        if (window->x >= other->x + other->width) continue;
+        if (other->y >= window->y + window->height) continue;
+        if (window->y >= other->y + other->height) continue;
+        return 1;
+    }
+    return 0;
+}
+
+static void repaint_timed_windows(const KOI_POINTER* pointer) {
+    for (int index = 0; index < order_count; index++) {
+        WINDOW* window = order[index];
+        int touches_pointer;
+
+        if (!window->needs_paint) continue;
+        window->needs_paint = 0;
+        if (window->minimised) continue;
+        if (window_overlapped(index)) { dirty = 1; continue; }
+
+        touches_pointer =
+            pointer->x + CURSOR_W > window->x &&
+            pointer->x < window->x + window->width &&
+            pointer->y + CURSOR_H > window->y &&
+            pointer->y < window->y + window->height;
+
+        if (touches_pointer) cursor_hide();
+        paint_window(window, index == order_count - 1);
+        /* And the menu that is hanging over it, again.
+         *
+         * A dropped-down menu is drawn over everything and belongs to nobody:
+         * repainting the window underneath puts the window's own contents
+         * back where the menu was, and the menu returns on the next full
+         * redraw - which is a menu that blinks at exactly the rate the window
+         * ticks at. A clock window did it once a second; a player advancing
+         * its progress bar did it four times a second, and there the menu was
+         * visible for a quarter of a second at a time.
+         *
+         * Cheap, because it happens only while a menu is down and only for
+         * the windows it actually covers. */
+        if (menu_open >= 0 &&
+            menu_x < window->x + window->width && menu_x + menu_w > window->x &&
+            menu_y < window->y + window->height && menu_y + menu_h > window->y)
+            paint_dropdown();
+        /* Again the cursor before the showing, and not after it. */
+        if (touches_pointer) cursor_paint(pointer->x, pointer->y);
+        koi_gfx_present_rect(window->x, window->y, window->width,
+                             window->height);
+    }
+}
+
 static int pump(WINDOW_EVENT* event) {
     int previous_x = pointer.x;
     int previous_y = pointer.y;
@@ -1377,11 +1877,13 @@ static int pump(WINDOW_EVENT* event) {
     if (!started) {
         koi_mouse(&pointer);
         last_press = pointer.presses[0];
+        last_press_right = pointer.presses[1];
         started = 1;
     }
 
     {
-        if (dirty) { draw_everything(); cursor_show(pointer.x, pointer.y); }
+        if (dirty) draw_everything();   /* the cursor is part of the frame */
+        else repaint_timed_windows(&pointer);
 
         koi_sleep(10);
 
@@ -1404,7 +1906,17 @@ static int pump(WINDOW_EVENT* event) {
                     window->tick(window);
                     busy_leave(window);
                 }
-                dirty = 1;
+                /* This window, and not the screen.
+                 *
+                 * A clock asking to be redrawn once a second used to mark the
+                 * whole desktop dirty, so every second the wallpaper, every
+                 * window and the taskbar were drawn again and the whole
+                 * framebuffer was sent - which is why the pointer blinked once
+                 * a second: it is lifted off the screen and put back around
+                 * every full repaint. One window's worth of pixels is a
+                 * hundredth of the work and does not touch the pointer at
+                 * all. */
+                window->needs_paint = 1;
             }
         }
 
@@ -1423,11 +1935,35 @@ static int pump(WINDOW_EVENT* event) {
                is the point of it. A menu holding the machine's power switch
                that only a pointer can reach is one somebody cannot use when
                the pointer is the thing that has stopped. */
+            /* Alt+F4: the window in front, or - when there is none - the
+               desktop itself, which is where "close what is in front" means
+               "there is nothing left to close" and every system since 95 has
+               asked whether you meant to leave. */
+            if (key == KOI_KEY_CLOSE) {
+                event->type = WINDOW_EVENT_CLOSE;
+                event->window = window_active();
+                event->id = 0;
+                return 1;
+            }
             if (key == KOI_KEY_MENU) {
                 if (!launcher_label[0]) return 0;
                 event->type = WINDOW_EVENT_LAUNCHER;
                 event->window = (WINDOW*)0;
                 event->id = 0;
+                return 1;
+            }
+            /* And Win+R, for the same reason as the other two: it is the
+               desktop's gesture, not the front window's.
+             *
+             * It was not reserved, so it was offered to whatever had the
+               keyboard - and every window with a key handler drops what it
+               does not recognise. The result was a Run box that worked on an
+               empty desktop and did nothing at all once a window was open,
+               which is the half of the time somebody wants it. */
+            if (key == KOI_KEY_RUN) {
+                event->type = WINDOW_EVENT_KEY;
+                event->window = (WINDOW*)0;
+                event->id = key;
                 return 1;
             }
             if (top && top->key) {
@@ -1444,6 +1980,26 @@ static int pump(WINDOW_EVENT* event) {
         }
 
         koi_mouse(&pointer);
+
+        /* A press held down over a window's contents, moving. The window
+           gets told where the pointer is now; what that means is its own
+           business - selecting text, drawing, dragging something around. */
+        if (pressing) {
+            if (!(pointer.buttons & KOI_BUTTON_LEFT)) {
+                pressing = (WINDOW*)0;
+            } else if (pointer.x != previous_x || pointer.y != previous_y) {
+                WINDOW* target = pressing;
+                int client_x, client_y, client_w, client_h;
+
+                window_client(target, &client_x, &client_y, &client_w,
+                              &client_h);
+                if (target->drag && busy_enter(target)) {
+                    target->drag(target, pointer.x - client_x,
+                                 pointer.y - client_y);
+                    busy_leave(target);
+                }
+            }
+        }
 
         if (dragging || sizing) {
             if (pointer.buttons & KOI_BUTTON_LEFT) {
@@ -1469,7 +2025,11 @@ static int pump(WINDOW_EVENT* event) {
             sizing = 0;
         }
 
-        if (pointer.presses[0] != last_press) {
+        if (pointer.presses[0] != last_press ||
+            pointer.presses[1] != last_press_right) {
+            /* Which button, before anything else: the left one has moved
+               unless it has not, and then it was the right. */
+            int right = pointer.presses[0] == last_press;
             /* A double click is two clicks close together in time and place,
              * not two that happened to land in one poll.
              *
@@ -1481,7 +2041,8 @@ static int pump(WINDOW_EVENT* event) {
              *
              * Half a second and four pixels, which is what everything else
              * uses and what a hand actually does. */
-            unsigned int clicks = pointer.presses[0] - last_press;
+            unsigned int clicks = right ? pointer.presses[1] - last_press_right
+                                        : pointer.presses[0] - last_press;
             koi_uint64 now = koi_uptime();
             int near = (pointer.x - last_click_x) * (pointer.x - last_click_x) +
                        (pointer.y - last_click_y) * (pointer.y - last_click_y) <= 16;
@@ -1496,6 +2057,48 @@ static int pump(WINDOW_EVENT* event) {
             int taken;
 
             last_press = pointer.presses[0];
+            last_press_right = pointer.presses[1];
+
+            /* The right button asks a question rather than doing something,
+             * and that is the whole of the difference: it opens whatever the
+             * thing under it has to offer, and if that thing offers nothing
+             * it does nothing at all. Nothing is raised, moved, resized or
+             * closed by it - a menu that rearranged the screen on its way up
+             * is a menu people stop trusting.
+             *
+             * Menus, the taskbar and the Start button are deliberately not
+             * asked: they have one behaviour each and a second one reached by
+             * the other button would be a secret. */
+            if (right) {
+                WINDOW* over = window_at(x, y);
+
+                if (!over) {
+                    if (y >= WINDOW_TOPBAR_H &&
+                        y < (int)screen.height - WINDOW_TASKBAR_H) {
+                        event->type = WINDOW_EVENT_DESKTOP;
+                        event->window = (WINDOW*)0;
+                        event->id = (int)clicks;
+                        event->x = x;
+                        event->y = y;
+                        event->button = WINDOW_BUTTON_RIGHT;
+                        return 1;
+                    }
+                    return 0;
+                }
+                {
+                    int client_x, client_y, client_w, client_h;
+
+                    window_client(over, &client_x, &client_y, &client_w,
+                                  &client_h);
+                    if (over->context && x >= client_x &&
+                        x < client_x + client_w && y >= client_y &&
+                        y < client_y + client_h && busy_enter(over)) {
+                        over->context(over, x - client_x, y - client_y);
+                        busy_leave(over);
+                    }
+                }
+                return 0;
+            }
 
             /* The taskbar button before anything else on the bar: it sits at
                the left where a window's own entry would otherwise be tested. */
@@ -1531,7 +2134,22 @@ static int pump(WINDOW_EVENT* event) {
             }
 
             hit = window_at(x, y);
-            if (!hit) return 0;
+            if (!hit) {
+                /* The wallpaper. Whatever is drawn on it belongs to whoever
+                   drew it, so the click goes out rather than being thrown
+                   away here. */
+                if (y >= WINDOW_TOPBAR_H &&
+                    y < (int)screen.height - WINDOW_TASKBAR_H) {
+                    event->type = WINDOW_EVENT_DESKTOP;
+                    event->window = (WINDOW*)0;
+                    event->id = (int)clicks;
+                    event->x = x;
+                    event->y = y;
+                    event->button = WINDOW_BUTTON_LEFT;
+                    return 1;
+                }
+                return 0;
+            }
             window_raise(hit);
 
             /* The title bar: its buttons, then dragging with what is left. */
@@ -1578,11 +2196,18 @@ static int pump(WINDOW_EVENT* event) {
             {
                 int client_x, client_y, client_w, client_h;
                 window_client(hit, &client_x, &client_y, &client_w, &client_h);
-                if (hit->click && x >= client_x && x < client_x + client_w &&
-                    y >= client_y && y < client_y + client_h &&
-                    busy_enter(hit)) {
-                    hit->click(hit, x - client_x, y - client_y, (int)clicks);
-                    busy_leave(hit);
+                if (x >= client_x && x < client_x + client_w &&
+                    y >= client_y && y < client_y + client_h) {
+                    /* Remembered for as long as the button is down, whether
+                       or not this window wants clicks: what follows a press
+                       is a drag, and the window that gets told is the one the
+                       press landed in. */
+                    pressing = hit;
+                    if (hit->click && busy_enter(hit)) {
+                        hit->click(hit, x - client_x, y - client_y,
+                                   (int)clicks);
+                        busy_leave(hit);
+                    }
                 }
             }
             return 0;

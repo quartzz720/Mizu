@@ -4,6 +4,7 @@
 #include "wav.h"
 #include "settings.h"
 #include "language.h"
+#include "wav.h"
 
 /* Mizu 0.5 - the desktop.
  *
@@ -23,7 +24,12 @@
 #define MENU_EXIT 2
 #define MENU_CONTROL 3
 #define MENU_CLOCK 4
-#define MENU_COMMANDER 5
+/* 5 was Koi-Commander, and it is not this desktop's to list: it is a Koi-DOS
+   program that arrives from dosget, and every installed package is already in
+   the Start menu. Left as a hole rather than reused - these ids travel out
+   through window.c and back. */
+#define MENU_IMAGE 5
+#define MENU_NAMI 18
 #define MENU_TILE 6
 #define MENU_NOTE 7
 /* 8 to 12 were NoteEdit's - Save, Bold, Italic, Underline, Plain - and are
@@ -45,6 +51,7 @@
 #define TERM "TERM.APP"
 #define IMAGE "IMAGE.APP"
 #define CONTROL "CONTROL.APP"
+#define NAMI "NAMI.APP"
 
 static WINDOW* control_window;
 static WINDOW* clock_window;
@@ -68,31 +75,78 @@ static int current_volume_index(void) {
  */
 typedef struct {
     const char* name;
-    koi_uint32 (*tint)(void);
+    const char* icon;          /* the drawing in ICONS\\, or null for none */
+    koi_uint32 (*tint)(void);  /* what to draw instead, when it is missing */
+    void (*open)(void);
 } ENTRY;
 
 static koi_uint32 tint_setup(void) { return koi_gfx_color(0x4A, 0x8F, 0xB8); }
 static koi_uint32 tint_files(void) { return koi_gfx_color(0x35, 0xA6, 0xC4); }
 static koi_uint32 tint_tools(void) { return koi_gfx_color(0x58, 0xB0, 0xA8); }
 
-static ENTRY entries[6];
+static void open_application(const char* file);
+static void open_clock(void);
+static void open_about(void);
+static int run_command(const char* command);
+
+static void open_files(void) { open_application(FILES); }
+static void open_terminal(void) { open_application(TERM); }
+static void open_notepad(void) { open_application(NOTEEDIT); }
+static void open_picture(void) { open_application(IMAGE); }
+static void open_music(void) { open_application(PLAYER); }
+static void open_settings(void) { open_application(CONTROL); }
+
+/* Eight things, and eight drawings for them.
+ *
+ * Koi-Commander used to be the second of these and is not here any more: it is
+ * a Koi-DOS program that exists on its own, arrives from dosget, and putting
+ * it in this desktop's panel claimed it as a part of the desktop. It is still
+ * in the Start menu with every other installed package, which is where a
+ * program that is not ours belongs.
+ *
+ * The names of the drawings are tied to the place rather than to the
+ * application, on purpose: the same application can stand in two places with
+ * different pictures, and a file called after the slot it fills is one anybody
+ * can replace without reading code. */
+static ENTRY entries[8];
 
 static void name_entries(void) {
-    entries[0] = (ENTRY){ say(SAY_FILES), tint_files };
-    entries[1] = (ENTRY){ say(SAY_COMMANDER), tint_files };
-    entries[2] = (ENTRY){ say(SAY_NOTEEDIT), tint_tools };
-    entries[3] = (ENTRY){ say(SAY_CLOCK), tint_setup };
-    entries[4] = (ENTRY){ "Player", tint_setup };
-    entries[5] = (ENTRY){ say(SAY_ABOUT), tint_tools };
+    entries[0] = (ENTRY){ say(SAY_FILES), "FILES32.BMP", tint_files, open_files };
+    entries[1] = (ENTRY){ "Koi-DOS", "TERM32.BMP", tint_files, open_terminal };
+    entries[2] = (ENTRY){ say(SAY_NOTEEDIT), "NOTE32.BMP", tint_tools, open_notepad };
+    entries[3] = (ENTRY){ "Picture", "IMAGE32.BMP", tint_tools, open_picture };
+    entries[4] = (ENTRY){ "Player", "PLAYER32.BMP", tint_setup, open_music };
+    entries[5] = (ENTRY){ say(SAY_CLOCK), "CLOCK32.BMP", tint_setup, open_clock };
+    entries[6] = (ENTRY){ say(SAY_SETTINGS), "SETUP32.BMP", tint_setup, open_settings };
+    entries[7] = (ENTRY){ say(SAY_ABOUT), "ABOUT32.BMP", tint_tools, open_about };
 }
-#define ENTRY_COUNT 6
+#define ENTRY_COUNT 8
 
 #define ICON_W 120
 #define ICON_H 96
 
-/* An icon, drawn rather than loaded. A picture would be a file to ship and a
-   format to decode; a rounded tile with a drop in it is three rectangles and
-   says the same thing at this size. */
+/* The icon of an entry, or a tile standing in for it.
+ *
+ * The drawings are files in the package and can be absent - somebody
+ * installed an older Mizu, or removed them, or is running the desktop out of
+ * a build directory. Standing in for a missing one costs three rectangles and
+ * keeps the panel a panel; refusing to draw the row would be a system that
+ * breaks because a picture is missing. */
+static void draw_icon(int x, int y, koi_uint32 tint);
+
+static void draw_entry_icon(int x, int y, const ENTRY* entry) {
+    int icon = entry->icon ? window_icon(entry->icon) : 0;
+
+    if (icon) {
+        window_icon_draw(icon, x + 16 - window_icon_width(icon) / 2,
+                         y + 16 - window_icon_height(icon) / 2);
+        return;
+    }
+    draw_icon(x - 16, y - 6, entry->tint());
+}
+
+/* A tile with a drop in it: what was drawn before there were drawings, and
+   what is still drawn when one is missing. */
 static void draw_icon(int x, int y, koi_uint32 tint) {
     koi_gfx_fill(x + 14, y + 6, 36, 30, tint);
     koi_gfx_fill(x + 14, y + 6, 36, 6,
@@ -160,7 +214,7 @@ static void paint_control(WINDOW* window, int x, int y, int width, int height) {
         int ix = x + 8 + column * ICON_W;
         int iy = y + 8 + row * ICON_H;
 
-        draw_icon(ix + (ICON_W - 8) / 2 - 32, iy, entries[index].tint());
+        draw_entry_icon(ix + (ICON_W - 8) / 2 - 16, iy + 4, &entries[index]);
         label_in_cell(ix, iy + 40, entries[index].name);
     }
 }
@@ -311,6 +365,103 @@ static int koi_strchr_simple(const char* text, char wanted) {
 
 static void open_application(const char* file);
 
+/* The Run box, from the Start menu or from Win+R - one function, because two
+   ways in must not become two behaviours. */
+static void run_dialog(void) {
+
+        /* Whatever the shell can run: a program, or a command like `dir` that
+           only exists inside it. Mizu does not look at what was typed and
+           does not need to - SYS_RUN hands the line to COMMAND, which is the
+           one place that knows what a command line means. What comes back is
+           the exit code, and KOI_EXIT_NOT_FOUND is the shell's "there is no
+           such command"; anything
+           else, including a program that failed for its own reasons, is the
+           program's business and not a thing to put a box in front of. */
+        static char line[96];
+        long code;
+
+        if (!window_prompt(say(SAY_RUN), say(SAY_RUN_ASK), say(DIALOG_OK),
+                           say(DIALOG_CANCEL), line, sizeof(line))) {
+            window_repaint();
+            return;
+        }
+        /* An application, if that is what was named.
+         *
+         * Written with .APP or without: `FILES` and `FILES.APP` mean the same
+         * thing here, because nobody should have to know that an application
+         * has a different extension from a program to open one. A bare name
+         * is looked for as an application first and handed to the shell only
+         * if there is no such file - so a program of the same name still
+         * runs, and typing `dir` still lists a directory. */
+        if (ends_with_ignoring_case(line, ".APP")) {
+            open_application(line);
+            window_repaint();
+            return;
+        }
+        /* The names Windows taught everybody.
+         *
+         * `explorer` is not what the browser is called and `cmd` is not what
+         * the terminal is called, and neither ever will be - a system that
+         * renames its own parts to match somebody else's has no parts of its
+         * own. But most people arriving here have Windows in their fingers,
+         * and a Run box that answers a name somebody already knows costs six
+         * lines and teaches the real one on the way: what opens is titled
+         * Files, and next time they type that. */
+        {
+            static const struct { const char* known; const char* ours; }
+            familiar[] = {
+                { "EXPLORER", FILES }, { "CMD", TERM }, { "COMMAND", TERM },
+                { "NOTEPAD", NOTEEDIT }, { "CONTROL", CONTROL },
+                { "MSPAINT", IMAGE }, { "PHOTOS", IMAGE }, { 0, 0 }
+            };
+
+            for (int index = 0; familiar[index].known; index++) {
+                const char* known = familiar[index].known;
+                int at = 0;
+
+                while (known[at]) {
+                    char typed = line[at];
+                    if (typed >= 'a' && typed <= 'z') typed = (char)(typed - 32);
+                    if (typed != known[at]) break;
+                    at++;
+                }
+                if (!known[at] && !line[at]) {
+                    open_application(familiar[index].ours);
+                    window_repaint();
+                    return;
+                }
+            }
+        }
+
+        {
+            char guess[128];
+            char beside[160];
+            int at = 0;
+
+            while (line[at] && at + 5 < (int)sizeof(guess)) {
+                guess[at] = line[at];
+                at++;
+            }
+            guess[at] = 0;
+            /* Only a bare word: anything with a dot, a backslash or an
+               argument is a command line and is the shell's business. */
+            if (at && !koi_strchr_simple(guess, '.') &&
+                !koi_strchr_simple(guess, '\\') &&
+                !koi_strchr_simple(guess, ' ')) {
+                strcpy(guess + at, ".APP");
+                if (koi_beside(guess, beside, sizeof(beside)) &&
+                    koi_exists(beside)) {
+                    open_application(guess);
+                    window_repaint();
+                    return;
+                }
+            }
+        }
+        code = run_command(line);
+        if (code == KOI_EXIT_NOT_FOUND)
+            window_message(say(SAY_RUN), say(SAY_RUN_FAILED), say(DIALOG_OK));
+}
+
 /* Open the Start menu, and do what was chosen.
  *
  * Programs are listed straight rather than in a submenu: with a handful of
@@ -372,67 +523,7 @@ static void start_menu(void) {
         }
         return;
     }
-    if (chosen == START_RUN) {
-        /* Whatever the shell can run: a program, or a command like `dir` that
-           only exists inside it. Mizu does not look at what was typed and
-           does not need to - SYS_RUN hands the line to COMMAND, which is the
-           one place that knows what a command line means. What comes back is
-           the exit code, and KOI_EXIT_NOT_FOUND is the shell's "there is no
-           such command"; anything
-           else, including a program that failed for its own reasons, is the
-           program's business and not a thing to put a box in front of. */
-        static char line[96];
-        long code;
-
-        if (!window_prompt(say(SAY_RUN), say(SAY_RUN_ASK), say(DIALOG_OK),
-                           say(DIALOG_CANCEL), line, sizeof(line))) {
-            window_repaint();
-            return;
-        }
-        /* An application, if that is what was named.
-         *
-         * Written with .APP or without: `FILES` and `FILES.APP` mean the same
-         * thing here, because nobody should have to know that an application
-         * has a different extension from a program to open one. A bare name
-         * is looked for as an application first and handed to the shell only
-         * if there is no such file - so a program of the same name still
-         * runs, and typing `dir` still lists a directory. */
-        if (ends_with_ignoring_case(line, ".APP")) {
-            open_application(line);
-            window_repaint();
-            return;
-        }
-        {
-            char guess[128];
-            char beside[160];
-            int at = 0;
-
-            while (line[at] && at + 5 < (int)sizeof(guess)) {
-                guess[at] = line[at];
-                at++;
-            }
-            guess[at] = 0;
-            /* Only a bare word: anything with a dot, a backslash or an
-               argument is a command line and is the shell's business. */
-            if (at && !koi_strchr_simple(guess, '.') &&
-                !koi_strchr_simple(guess, '\\') &&
-                !koi_strchr_simple(guess, ' ')) {
-                strcpy(guess + at, ".APP");
-                if (koi_beside(guess, beside, sizeof(beside)) &&
-                    koi_exists(beside)) {
-                    open_application(guess);
-                    window_repaint();
-                    return;
-                }
-            }
-        }
-        koi_gfx_leave();
-        code = koi_run(line);
-        if (window_reopen_desktop()) window_repaint();
-        if (code == KOI_EXIT_NOT_FOUND)
-            window_message(say(SAY_RUN), say(SAY_RUN_FAILED), say(DIALOG_OK));
-        return;
-    }
+    if (chosen == START_RUN) { run_dialog(); return; }
     if (chosen == START_SETTINGS) {
         /* Settings, and not the control panel: the panel is a page of things
            to start, which is what Program Manager was. This is where the
@@ -481,19 +572,175 @@ static APPLICATION applications[APPLICATION_MAX];
    taken back here, because an application cannot know what else is on it. */
 static int open_file(const char* path);
 
+/* ---- The output of a program that only printed -------------------------
+ *
+ * A window with what it said in it, which is where a console program's output
+ * belongs when there is a desktop. Windows called this a DOS box and drew a
+ * frame around a console; this is smaller and honest about being smaller - it
+ * shows what was printed and it does not take typing, because the program has
+ * already finished by the time this appears.
+ *
+ * One window, reused: two of these open at once would be two programs' output
+ * on screen with nothing to say which is which, and the second would be the
+ * one somebody wanted anyway.
+ */
+static WINDOW* output_window;
+static char output_text[8192];
+static int output_top;          /* the first line shown */
+
+static int output_line_count(void) {
+    int lines = 1;
+    for (int at = 0; output_text[at]; at++)
+        if (output_text[at] == '\n') lines++;
+    return lines;
+}
+
+static void paint_output(WINDOW* self, int x, int y, int width, int height) {
+    int line = 0;
+    int at = 0;
+    int rows = height / WINDOW_CHAR_H;
+
+    (void)self;
+    (void)width;
+    while (output_text[at] && line < output_top + rows) {
+        char shown[128];
+        int length = 0;
+
+        while (output_text[at] && output_text[at] != '\n' &&
+               length + 1 < (int)sizeof(shown))
+            shown[length++] = output_text[at++];
+        shown[length] = 0;
+        while (output_text[at] && output_text[at] != '\n') at++;
+        if (output_text[at]) at++;
+
+        if (line >= output_top)
+            window_label(x + 4, y + (line - output_top) * WINDOW_CHAR_H, shown,
+                         window_text);
+        line++;
+    }
+}
+
+static void key_output(WINDOW* self, int pressed) {
+    int client_x, client_y, client_w, client_h;
+    int rows;
+
+    window_client(self, &client_x, &client_y, &client_w, &client_h);
+    rows = client_h / WINDOW_CHAR_H;
+    switch (pressed) {
+    case KOI_KEY_UP: if (output_top) output_top--; break;
+    case KOI_KEY_DOWN:
+        if (output_top + rows < output_line_count()) output_top++;
+        break;
+    case KOI_KEY_PAGE_UP:
+        output_top -= rows;
+        if (output_top < 0) output_top = 0;
+        break;
+    case KOI_KEY_PAGE_DOWN:
+        if (output_top + rows < output_line_count()) output_top += rows;
+        break;
+    default: return;
+    }
+    window_repaint();
+}
+
+static void show_output(const char* command, const char* text) {
+    int at = 0;
+    int width;
+    int height;
+
+    while (text[at] && at + 1 < (int)sizeof(output_text)) {
+        output_text[at] = text[at];
+        at++;
+    }
+    output_text[at] = 0;
+    output_top = 0;
+
+    /* Sized to what was printed, within what the screen has.
+     *
+     * A fixed window cut the top off DOSFETCH, whose first act is to draw its
+     * name in letters eight rows high - and a window that cuts off the part a
+     * program clearly meant somebody to see is a window that was measured for
+     * nothing in particular. The longest line and the number of lines are
+     * known here; the screen's size is a question the kernel answers. */
+    {
+        int longest = 0;
+        int columns = 0;
+        int lines = 1;
+        int most_wide = (int)koi_sysinfo(KOI_INFO_SCREEN_WIDTH, 0) - 60;
+        int most_tall = (int)koi_sysinfo(KOI_INFO_SCREEN_HEIGHT, 0) - 120;
+
+        for (int scan = 0; output_text[scan]; scan++) {
+            if (output_text[scan] == '\n') {
+                if (columns > longest) longest = columns;
+                columns = 0;
+                lines++;
+                continue;
+            }
+            /* Columns rather than bytes: the text may be in a language whose
+               letters take more than one. */
+            if (((unsigned char)output_text[scan] & 0xC0) != 0x80) columns++;
+        }
+        if (columns > longest) longest = columns;
+
+        width = longest * WINDOW_CHAR_W + 2 * WINDOW_BORDER + 10;
+        height = lines * WINDOW_CHAR_H + WINDOW_TITLE_H + 2 * WINDOW_BORDER + 8;
+        if (width < 320) width = 320;
+        if (height < 160) height = 160;
+        if (most_wide > 200 && width > most_wide) width = most_wide;
+        if (most_tall > 160 && height > most_tall) height = most_tall;
+    }
+
+    if (!output_window) {
+        output_window = window_new(command, 60, 90, width, height);
+        if (!output_window) return;
+        output_window->paint = paint_output;
+        output_window->key = key_output;
+    } else {
+        strncpy(output_window->title, command, WINDOW_TITLE_MAX - 1);
+        output_window->width = width;
+        output_window->height = height;
+        output_window->minimised = 0;
+        window_raise(output_window);
+    }
+    window_repaint();
+}
+
+/* Run a Koi-DOS program without giving the screen away first.
+ *
+ * This used to hand the screen back, run, and take it again - so a program
+ * that only prints made the desktop disappear, showed half a second of
+ * console, and came back. That flash was the desktop's doing, not the
+ * program's: the program never wanted the screen at all.
+ *
+ * The kernel stacks the screen now. A program that asks for it is laid over
+ * whoever is holding it, and the desktop's pixels sit untouched underneath
+ * until it ends - so DOOM still takes the whole display, and coming back is
+ * one blit rather than a repaint. A program that only prints never asks, the
+ * screen never changes hands, and its output is collected instead and shown
+ * in a window.
+ *
+ * Which of the two it is nobody has to declare. The program says so by what
+ * it does, at the moment it does it - which is the same answer Windows wrote
+ * into a header, arrived at from the other end. */
 static int run_command(const char* command) {
-    int code;
+    static char collected[8192];
+    long length;
 
     if (!command || !command[0]) return -1;
-    koi_gfx_leave();
-    code = koi_run(command);
+
+    length = koi_capture(command, collected, sizeof(collected));
+
     /* Whatever was typed at the program that has just ended belongs to it and
        not to the desktop. Without this, quitting DOOM with F10 and Y handed
        the desktop a Y, and the Escape somebody pressed to leave a menu closed
        whichever window happened to be in front when it came back. */
     while (koi_keypressed()) (void)koi_getchar();
-    if (window_reopen_desktop()) window_repaint();
-    return code;
+    window_repaint();
+
+    /* It printed something and did not take the screen: a console program,
+       and its output belongs in a window rather than nowhere. */
+    if (length > 0) show_output(command, collected);
+    return koi_last_exit();
 }
 
 /* Everything on the desktop that is a phrase, so that changing the language
@@ -522,7 +769,7 @@ static void relabel(void) {
     desktop_menus_here[1] = (WINDOW_MENU){ say(SAY_MENU_RUN),
         { { say(SAY_FILES), MENU_FILES }, { say(SAY_NOTEEDIT), MENU_NOTE },
           { "Player", MENU_PLAYER }, { "Koi-DOS", MENU_TERM },
-          { say(SAY_COMMANDER), MENU_COMMANDER } }, 5 };
+          { "Picture", MENU_IMAGE }, { "Nami Explorer", MENU_NAMI } }, 6 };
     desktop_menus_here[2] = (WINDOW_MENU){ say(SAY_MENU_VIEW),
         { { say(SAY_CONTROL_PANEL), MENU_CONTROL },
           { say(SAY_CLOCK), MENU_CLOCK }, { 0, 0 },
@@ -532,8 +779,7 @@ static void relabel(void) {
 
     if (panel_menus_here) {
         panel_menus_here[0] = (WINDOW_MENU){ say(SAY_MENU_FILE),
-            { { say(SAY_COMMANDER), MENU_COMMANDER }, { 0, 0 },
-              { say(SAY_EXIT), MENU_EXIT } }, 3 };
+            { { say(SAY_EXIT), MENU_EXIT } }, 1 };
         panel_menus_here[1] = (WINDOW_MENU){ say(SAY_MENU_OPTIONS),
             { { say(SAY_ABOUT), MENU_ABOUT } }, 1 };
         if (control_window) {
@@ -608,6 +854,10 @@ static const MIZU_API mizu_api = {
     .confirm = window_confirm,
     .message = window_message,
     .prompt = window_prompt,
+    .context_menu = window_context,
+    .scrollbar = window_scrollbar,
+    .scrollbar_press = window_scrollbar_press,
+    .scrollbar_drag = window_scrollbar_drag,
     .say = say,
     .yield = window_yield,
     .run = run_command,
@@ -682,8 +932,11 @@ static void open_application(const char* file) {
 static int open_file(const char* path) {
     static const struct { const char* suffix; const char* application; }
     openers[] = {
-        { ".BMP", IMAGE }, { ".TXT", NOTEEDIT }, { ".MD", NOTEEDIT },
-        { ".BAT", NOTEEDIT }, { ".CFG", NOTEEDIT }, { ".LOG", NOTEEDIT },
+        { ".BMP", IMAGE }, { ".PNG", IMAGE }, { ".GIF", IMAGE },
+        { ".WAV", PLAYER }, { ".MP3", PLAYER },
+        { ".HTM", NAMI }, { ".HTML", NAMI },
+        { ".TXT", NOTEEDIT }, { ".MD", NOTEEDIT }, { ".BAT", NOTEEDIT },
+        { ".CFG", NOTEEDIT }, { ".LOG", NOTEEDIT }, { ".INI", NOTEEDIT },
         { 0, 0 }
     };
 
@@ -698,12 +951,33 @@ static int open_file(const char* path) {
         slot->window = slot->app->open_with(path);
         return slot->window != (WINDOW*)0;
     }
-    return 0;
+
+    /* Anything else that is not a program: the notepad.
+     *
+     * A desktop that answers "nothing opens that" for every extension nobody
+     * has written a table entry for is a desktop that mostly says no. A file
+     * is text until proven otherwise, and a windowed editor showing bytes is
+     * a fair answer to an unknown one - it is what Windows did with Notepad
+     * for years and it is better than the alternative here, which was running
+     * the console editor with its output collected where nobody could see it
+     * and the desktop stopped waiting for it to finish.
+     *
+     * Programs are excluded, because a program is something to run. */
+    if (ends_with_ignoring_case(path, ".EXE") ||
+        ends_with_ignoring_case(path, ".COM") ||
+        ends_with_ignoring_case(path, ".BAT") ||
+        ends_with_ignoring_case(path, ".APP")) return 0;
+    {
+        APPLICATION* slot = load_application(NOTEEDIT);
+
+        if (!slot || slot->app->version < 2 || !slot->app->open_with) return 0;
+        slot->window = slot->app->open_with(path);
+        return slot->window != (WINDOW*)0;
+    }
 }
 
 static void open_about(void);
 static void open_clock(void);
-static void start_commander(void);
 
 /* Close one window and forget the pointer to it.
  *
@@ -724,30 +998,64 @@ static void close_window(WINDOW* window) {
     }
     if (window == clock_window) clock_window = (WINDOW*)0;
     if (window == about_window) about_window = (WINDOW*)0;
+    if (window == output_window) output_window = (WINDOW*)0;
     window_delete(window);
 }
 
-static void click_control(WINDOW* window, int x, int y, int clicks) {
+/* Which cell of the grid a point is in, or -1. */
+static int entry_at(int x, int y) {
+    int client_x, client_y, client_w, client_h;
     int columns;
     int index;
-    int client_x, client_y, client_w, client_h;
 
-    (void)window;
+    if (!control_window) return -1;
     window_client(control_window, &client_x, &client_y, &client_w, &client_h);
     columns = client_w / ICON_W;
     if (columns < 1) columns = 1;
+    if (x < 8 || y < 8) return -1;
     index = (y - 8) / ICON_H * columns + (x - 8) / ICON_W;
-    if (index < 0 || index >= ENTRY_COUNT) return;
+    if (index < 0 || index >= ENTRY_COUNT) return -1;
+    return index;
+}
+
+/* The right button on a cell: what can be done with the thing it stands for.
+ *
+ * Two entries, and the second of them is the honest half - Open is what a
+ * double click already does, and having it here is not for people who cannot
+ * double-click but for people who are looking for what is possible. A context
+ * menu is where a system says what it can do. */
+static void context_control(WINDOW* window, int x, int y) {
+    WINDOW_ITEM items[3];
+    int index = entry_at(x, y);
+    int client_x, client_y, client_w, client_h;
+    int chosen;
+
+    (void)window;
+    if (index < 0) return;
+    window_client(control_window, &client_x, &client_y, &client_w, &client_h);
+
+    items[0].label = say(SAY_OPEN);
+    items[0].id = 1;
+    items[1].label = say(SAY_ABOUT);
+    items[1].id = 2;
+    /* Screen coordinates: the handler is given the window's own, and the menu
+       is drawn on the screen. */
+    chosen = window_context(items, 2, client_x + x, client_y + y);
+    window_repaint();
+    if (chosen == 1 && entries[index].open) entries[index].open();
+    else if (chosen == 2) open_about();
+}
+
+static void click_control(WINDOW* window, int x, int y, int clicks) {
+    int index = entry_at(x, y);
+
+    (void)window;
+    if (index < 0) return;
     /* Twice, as Program Manager had it: one click to point at a thing and two
        to set it going, so a hand resting on the button does not launch it. */
     if (clicks < 2) return;
 
-    if (index == 0) open_application(FILES);
-    else if (index == 1) start_commander();
-    else if (index == 2) open_application(NOTEEDIT);
-    else if (index == 3) open_clock();
-    else if (index == 4) open_application(PLAYER);
-    else open_about();
+    if (entries[index].open) entries[index].open();
 }
 
 /* ---- The clock ----------------------------------------------------------- */
@@ -874,21 +1182,60 @@ static void open_about(void) {
    started here: ask for it, ask for this desktop after it, and leave. The
    screen goes away and comes back, which is honest about what the machine can
    do rather than a window pretending otherwise. */
-/* Run it and come back, rather than asking the shell to restart this
- * afterwards.
+
+/* The sound the desktop makes when it starts.
  *
- * Mizu used to give up its memory, chain the program, chain itself, and exit -
- * so everything on screen went away, the desktop was rebuilt from a command
- * line carrying its own state, and it was visibly a restart. It stays resident
- * now and gets control back where it left off.
+ * Beside the program, like the wallpaper: the package is installed wherever
+ * dosget put it. Absent is not an error - a desktop that refuses to start
+ * because a sound file is missing would be a poor trade for a noise.
  *
- * The screen is handed back first because the thing being started expects a
- * console, and taken again afterwards. That much is still visible and is
- * honest: two full-screen programs cannot both have the screen. */
-static void start_commander(void) {
-    koi_gfx_leave();
-    koi_run("\\COMMANDER\\COMMANDER");
-    if (window_reopen_desktop()) window_repaint();
+ * The samples are not copied by the mixer, so the buffer has to outlive the
+ * sound: it is allocated once and never freed, which for one file played once
+ * at startup is the honest arrangement rather than a leak. Playing does not
+ * block, so the desktop draws while it sounds - which is the whole point of a
+ * startup sound and was the one thing Windows 95 got exactly right about it.
+ */
+static void play_startup_sound(void) {
+    char path[128];
+    WAV_FORMAT format;
+    unsigned int data_at = 0;
+    unsigned int frames;
+    const char* why;
+    long handle;
+    long size;
+    koi_uint8* file;
+
+    if (!koi_beside("START.WAV", path, sizeof(path))) return;
+    handle = koi_open(path, OPEN_READ);
+    if (handle < 0) return;
+
+    size = koi_seek(handle, 0, KOI_SEEK_END);
+    (void)koi_seek(handle, 0, KOI_SEEK_SET);
+    if (size <= 0) { koi_close(handle); return; }
+
+    file = (koi_uint8*)koi_alloc(size);
+    if (!file) { koi_close(handle); return; }
+    {
+        long done = 0;
+        while (done < size) {
+            long got = koi_read(handle, file + done, size - done);
+            if (got <= 0) break;
+            done += got;
+        }
+        koi_close(handle);
+        if (done != size) { koi_free(file); return; }
+    }
+
+    {
+        unsigned int bytes = wav_parse(file, (unsigned int)size, &format,
+                                       &data_at, &why);
+        if (!bytes) { koi_free(file); return; }
+        frames = bytes / (format.channels * (format.bits / 8));
+    }
+    if (!frames) { koi_free(file); return; }
+
+    (void)koi_sound_play_simple(file + data_at, frames, format.rate,
+                                format.bits, format.channels, 255);
 }
 
 int main(void) {
@@ -946,19 +1293,19 @@ int main(void) {
     desktop[1] = (WINDOW_MENU){ say(SAY_MENU_RUN),
         { { say(SAY_FILES), MENU_FILES }, { say(SAY_NOTEEDIT), MENU_NOTE },
           { "Player", MENU_PLAYER }, { "Koi-DOS", MENU_TERM },
-          { say(SAY_COMMANDER), MENU_COMMANDER } }, 5 };
+          { "Picture", MENU_IMAGE }, { "Nami Explorer", MENU_NAMI } }, 6 };
     desktop[2] = (WINDOW_MENU){ say(SAY_MENU_VIEW),
         { { say(SAY_CONTROL_PANEL), MENU_CONTROL },
           { say(SAY_CLOCK), MENU_CLOCK }, { 0, 0 },
           { say(SAY_TILE), MENU_TILE } }, 4 };
     panel[0] = (WINDOW_MENU){ say(SAY_MENU_FILE),
-        { { say(SAY_COMMANDER), MENU_COMMANDER }, { 0, 0 },
-          { say(SAY_EXIT), MENU_EXIT } }, 3 };
+        { { say(SAY_EXIT), MENU_EXIT } }, 1 };
     panel[1] = (WINDOW_MENU){ say(SAY_MENU_OPTIONS),
         { { say(SAY_ABOUT), MENU_ABOUT } }, 1 };
 
     window_desktop_menu(desktop, 3);
     window_launcher(say(SAY_START));
+    play_startup_sound();
     remember_labels(desktop, panel);
 
     name_entries();
@@ -966,6 +1313,7 @@ int main(void) {
     if (control_window) {
         control_window->paint = paint_control;
         control_window->click = click_control;
+        control_window->context = context_control;
         control_window->menu_count = 2;
         control_window->menus[0] = panel[0];
         control_window->menus[1] = panel[1];
@@ -974,7 +1322,30 @@ int main(void) {
 
     while (window_next(&event)) {
         if (event.type == WINDOW_EVENT_CLOSE) {
-            if (event.window == control_window) { window_quit(); break; }
+            /* Closing the control panel closes the control panel.
+             *
+             * It used to end the session, which is Windows 3.0's arrangement -
+             * Program Manager was the shell, and closing it was leaving. The
+             * shape here is 9x: the desktop is the shell, the panel is a
+             * window on it, and the way out is System - Exit to DOS, said in
+             * words, on purpose.
+             *
+             * With nothing left open, Alt+F4 asks whether to turn the machine
+             * off, which is where that key goes on every system since. */
+            if (!event.window) {
+                if (window_confirm(say(SAY_SHUT_DOWN), say(SAY_SHUT_DOWN_ASK),
+                                   say(DIALOG_OK), say(DIALOG_CANCEL), 0) == 1) {
+                    koi_gfx_leave();
+                    koi_run("shutdown");
+                }
+                window_repaint();
+                continue;
+            }
+            if (event.window == control_window) {
+                window_delete(control_window);
+                control_window = (WINDOW*)0;
+                continue;
+            }
             close_window(event.window);
             continue;
         }
@@ -996,7 +1367,8 @@ int main(void) {
             case MENU_NOTE: open_application(NOTEEDIT); break;
             case MENU_PLAYER: open_application(PLAYER); break;
             case MENU_CLOCK: open_clock(); break;
-            case MENU_COMMANDER: start_commander(); break;
+            case MENU_IMAGE: open_application(IMAGE); break;
+            case MENU_NAMI: open_application(NAMI); break;
             case MENU_CONTROL:
                 if (control_window) {
                     control_window->minimised = 0;
@@ -1005,6 +1377,7 @@ int main(void) {
                 break;
             case MENU_TILE: window_tile(); break;
             case MENU_EXIT:
+                koi_log("MIZU: Exit to DOS was chosen\n");
                 /* "Close" in a window's own File menu closes that window;
                    "Exit to DOS" in the desktop's menu ends everything. */
                 window_quit();
@@ -1024,6 +1397,50 @@ int main(void) {
          * the desktop: closing it is leaving, and leaving is the thing Escape
          * must not do by accident. */
         if (event.type == WINDOW_EVENT_LAUNCHER) { start_menu(); continue; }
+
+        /* The desktop itself was clicked.
+         *
+         * The right button opens what there is to do here, at the pointer,
+         * the way it has since Windows 95: the things that are about the
+         * desktop rather than about any window. The left button does nothing
+         * yet - there is nothing on the wallpaper to select - and saying so
+         * here is cheaper than wondering later why the case is missing. */
+        if (event.type == WINDOW_EVENT_DESKTOP) {
+            WINDOW_ITEM items[6];
+            int count = 0;
+            int chosen;
+
+            if (event.button != WINDOW_BUTTON_RIGHT) continue;
+
+            items[count].label = say(SAY_CONTROL_PANEL);
+            items[count++].id = MENU_CONTROL;
+            items[count].label = say(SAY_RUN);
+            items[count++].id = START_RUN;
+            items[count].label = say(SAY_TILE);
+            items[count++].id = MENU_TILE;
+            items[count].label = 0;
+            items[count++].id = 0;
+            items[count].label = say(SAY_ABOUT);
+            items[count++].id = MENU_ABOUT;
+
+            chosen = window_context(items, count, event.x, event.y);
+            window_repaint();
+            if (chosen == MENU_CONTROL) {
+                if (control_window) {
+                    control_window->minimised = 0;
+                    window_raise(control_window);
+                }
+            }
+            else if (chosen == START_RUN) run_dialog();
+            else if (chosen == MENU_TILE) window_tile();
+            else if (chosen == MENU_ABOUT) open_about();
+            continue;
+        }
+        /* Win+R goes straight to the Run box, without the menu it lives in. */
+        if (event.type == WINDOW_EVENT_KEY && event.id == KOI_KEY_RUN) {
+            run_dialog();
+            continue;
+        }
         if (event.type == WINDOW_EVENT_KEY && event.id == 27) {
             WINDOW* front = window_active();
 
@@ -1031,6 +1448,10 @@ int main(void) {
         }
     }
 
+    /* And which way out was taken, in the one place every way out passes
+       through. A desktop that vanishes without a word is a bug report nobody
+       can answer. */
+    koi_log("MIZU: the event loop ended\n");
     window_close_desktop();
     return 0;
 }

@@ -1,4 +1,6 @@
 #include "mizu.h"
+#include "png.h"
+#include "gif.h"
 
 /* A picture, in a window.
  *
@@ -41,21 +43,206 @@ static koi_uint16 read16(const koi_uint8* at) {
     return (koi_uint16)((koi_uint32)at[0] | ((koi_uint32)at[1] << 8));
 }
 
+/* Reading, in pieces large enough to be worth the asking.
+ *
+ * A picture was read one row at a time, which for a photograph is a thousand
+ * system calls and a thousand trips through the file system to move three
+ * kilobytes each. Measured on the same file: 212 ms a row at a time against
+ * 130 ms in thirty-two kilobyte pieces from the disk, and 106 against 84 from
+ * a USB stick. Half again, for a buffer and twenty lines.
+ *
+ * What is left after this is the size of the file itself. An uncompressed BMP
+ * of 1920 by 1080 is six megabytes and every one of them has to arrive; no
+ * amount of buffering makes that instant, and the answer to it is a format
+ * that compresses. */
+#define READ_CHUNK 32768
+
+static unsigned char buffered[READ_CHUNK];
+static long buffered_have;
+static long buffered_at;
+
+static void reading_begins(void) {
+    buffered_have = 0;
+    buffered_at = 0;
+}
+
 static int read_exactly(long handle, void* into, long length) {
+    unsigned char* out = (unsigned char*)into;
     long done = 0;
+
     while (done < length) {
-        long got = koi_read(handle, (char*)into + done, length - done);
-        if (got <= 0) return 0;
-        done += got;
+        long available = buffered_have - buffered_at;
+        long take;
+
+        if (available <= 0) {
+            long got = koi_read(handle, buffered, READ_CHUNK);
+
+            if (got <= 0) return 0;
+            buffered_have = got;
+            buffered_at = 0;
+            available = got;
+        }
+        take = length - done;
+        if (take > available) take = available;
+        for (long index = 0; index < take; index++)
+            out[done + index] = buffered[buffered_at + index];
+        buffered_at += take;
+        done += take;
     }
     return 1;
 }
 
+/* The picture as it appears in the window, kept.
+ *
+ * Scaling used to happen inside paint - every repaint, and one system call per
+ * row of it. A window seven hundred rows tall was seven hundred calls and a
+ * full resample of the picture every time the clock ticked, which is what
+ * "the system lags while a picture is open" was.
+ *
+ * So it is scaled once, when the picture is loaded or the window is resized,
+ * and painting is one blit of the result. The test for "is it still valid" is
+ * the size it was made for: a window that has not changed size does not need
+ * it made again. */
+static koi_uint32* scaled;
+static int scaled_width;
+static int scaled_height;
+static int scaled_for_width;
+static int scaled_for_height;
+
+static void forget_scaled(void) {
+    if (scaled) koi_free(scaled);
+    scaled = (koi_uint32*)0;
+    scaled_width = 0;
+    scaled_height = 0;
+    scaled_for_width = 0;
+    scaled_for_height = 0;
+}
+
 static void forget(void) {
+    forget_scaled();
     if (pixels) koi_free(pixels);
     pixels = (koi_uint32*)0;
     image_width = 0;
     image_height = 0;
+}
+
+/* A PNG, which needs the whole file in memory and room for the rows it
+ * expands into - both borrowed for the length of the call and given back.
+ *
+ * The transparent parts are composited onto the window's paper colour rather
+ * than kept: this viewer draws opaque pixels, and a picture handed over with
+ * an alpha channel would leave every caller inventing its own answer. Paper
+ * is the right answer here because that is what is behind it. */
+/* A GIF, of which the first frame is shown. An animated one has its later
+ * frames read and ignored here: this window paints when it is told to, and
+ * making it paint on a timer belongs with the browser's animation rather than
+ * beside it. */
+static int load_gif(long handle, long size) {
+    koi_uint8* file = (koi_uint8*)koi_alloc(size);
+    koi_uint8* scratch;
+    GIF gif;
+    long got = 0;
+
+    if (!file) {
+        koi_snprintf(trouble, sizeof(trouble), "Not enough memory for it.");
+        return 0;
+    }
+    while (got < size) {
+        long step = koi_read(handle, file + got, size - got);
+
+        if (step <= 0) break;
+        got += step;
+    }
+    if (got != size || !gif_open(file, got, &gif)) {
+        koi_snprintf(trouble, sizeof(trouble), "%s", gif_trouble());
+        koi_free(file);
+        return 0;
+    }
+
+    pixels = (koi_uint32*)koi_alloc((long)gif.width * gif.height * 4);
+    scratch = (koi_uint8*)koi_alloc((long)gif.width * gif.height + 64);
+    if (!pixels || !scratch) {
+        koi_snprintf(trouble, sizeof(trouble),
+                     "Not enough memory for a picture that size.");
+        if (scratch) koi_free(scratch);
+        forget();
+        koi_free(file);
+        return 0;
+    }
+
+    if (!gif_frame(&gif, 0, pixels, mizu->color(MIZU_COLOR_PAPER), scratch,
+                   (long)gif.width * gif.height + 64)) {
+        koi_snprintf(trouble, sizeof(trouble), "%s", gif_trouble());
+        koi_free(scratch);
+        forget();
+        koi_free(file);
+        return 0;
+    }
+
+    image_width = gif.width;
+    image_height = gif.height;
+    koi_free(scratch);
+    koi_free(file);
+    return 1;
+}
+
+static int load_png(long handle, long size) {
+    koi_uint8* file = (koi_uint8*)koi_alloc(size);
+    koi_uint8* work;
+    long work_size;
+    long got = 0;
+    int width, height;
+    PNG picture;
+
+    if (!file) {
+        koi_snprintf(trouble, sizeof(trouble), "Not enough memory for it.");
+        return 0;
+    }
+    while (got < size) {
+        long step = koi_read(handle, file + got, size - got);
+
+        if (step <= 0) break;
+        got += step;
+    }
+    if (got != size || !png_size(file, got, &width, &height)) {
+        koi_snprintf(trouble, sizeof(trouble), "%s", png_trouble());
+        koi_free(file);
+        return 0;
+    }
+
+    pixels = (koi_uint32*)koi_alloc((long)width * height * 4);
+    /* Four bytes a pixel plus a filter byte a row is the most the rows can
+       expand to, and the file itself sits in front of that because inflate
+       reads its input while writing its output. */
+    work_size = size + ((long)width * 4 + 1) * height + 64;
+    work = (koi_uint8*)koi_alloc(work_size);
+    if (!pixels || !work) {
+        koi_snprintf(trouble, sizeof(trouble),
+                     "Not enough memory for a picture that size.");
+        if (work) koi_free(work);
+        forget();
+        koi_free(file);
+        return 0;
+    }
+
+    /* The file is copied to the front of the working buffer, because the
+       decoder wants its input and its output in one region it was given. */
+    for (long at = 0; at < got; at++) work[at] = file[at];
+    koi_free(file);
+    png_scratch(work, work_size);
+
+    if (!png_decode(work, got, pixels, (long)width * height,
+                    mizu->color(MIZU_COLOR_PAPER), &picture)) {
+        koi_snprintf(trouble, sizeof(trouble), "%s", png_trouble());
+        koi_free(work);
+        forget();
+        return 0;
+    }
+    koi_free(work);
+
+    image_width = picture.width;
+    image_height = picture.height;
+    return 1;
 }
 
 static int load(const char* path) {
@@ -73,8 +260,45 @@ static int load(const char* path) {
     trouble[0] = 0;
     handle = koi_open(path, OPEN_READ);
     if (handle < 0) { koi_snprintf(trouble, sizeof(trouble), "Cannot open it."); return 0; }
-    if (!read_exactly(handle, header, 54) || header[0] != 'B' || header[1] != 'M') {
-        koi_snprintf(trouble, sizeof(trouble), "That is not a BMP.");
+    reading_begins();
+    if (!read_exactly(handle, header, 8)) {
+        koi_snprintf(trouble, sizeof(trouble), "There is nothing in that file.");
+        koi_close(handle);
+        return 0;
+    }
+    /* Which kind by what is in it rather than by what it is called. A picture
+       saved with the wrong ending is somebody else's mistake and not a reason
+       to refuse it. */
+    if (gif_is_gif(header, 8)) {
+        long size = koi_filesize(handle);
+        int ok;
+
+        koi_seek(handle, 0, 0);
+        ok = load_gif(handle, size);
+        koi_close(handle);
+        if (ok) {
+            koi_snprintf(shown, sizeof(shown), "%s", path);
+            forget_scaled();
+        }
+        return ok;
+    }
+    if (png_is_png(header, 8)) {
+        long size = koi_filesize(handle);
+        int ok;
+
+        koi_seek(handle, 0, 0);
+        ok = load_png(handle, size);
+        koi_close(handle);
+        if (ok) {
+            koi_snprintf(shown, sizeof(shown), "%s", path);
+            forget_scaled();
+        }
+        return ok;
+    }
+    if (!read_exactly(handle, header + 8, 46) || header[0] != 'B' ||
+        header[1] != 'M') {
+        koi_snprintf(trouble, sizeof(trouble),
+                     "That is not a picture this reads - BMP, PNG and GIF.");
         koi_close(handle);
         return 0;
     }
@@ -122,6 +346,21 @@ static int load(const char* path) {
         long target = upside_down ? line : height - 1 - line;
         koi_uint32* into = pixels + target * width;
 
+        /* A turn for the desktop, every so often.
+         *
+         * A large picture is a second or two of reading, and this loop used to
+         * take all of it without once letting go - so the clock stopped, the
+         * pointer stuck where it was, and the whole machine appeared to seize
+         * until the window opened. It was not seized; it was being polite to
+         * nobody. Cooperative multitasking means exactly this line, and a loop
+         * that does not have one is the cost being paid in full.
+         *
+         * Every sixteenth row rather than every row: yielding is a pass of the
+         * desktop's loop, and doing that a thousand times would cost more than
+         * the reading does. Sixteen rows is a few milliseconds, which is under
+         * what a hand can notice. */
+        if ((line & 15) == 0) mizu->yield();
+
         if (!read_exactly(handle, row, padded)) {
             koi_snprintf(trouble, sizeof(trouble), "It ends before its pixels do.");
             koi_close(handle);
@@ -153,13 +392,13 @@ static void paint(WINDOW* self, int x, int y, int width, int height) {
         return;
     }
 
-    {
-        /* Fit, and never enlarge: the same picture at the same size in a
-           bigger window, centred, which is what somebody expects. */
+    /* Made to fit this window, if it has not been already. */
+    if (!scaled || scaled_for_width != width || scaled_for_height != height) {
         int drawn_w = image_width;
         int drawn_h = image_height;
-        int left, top;
 
+        /* Fit, and never enlarge: the same picture at the same size in a
+           bigger window, centred, which is what somebody expects. */
         if (drawn_w > width) {
             drawn_h = drawn_h * width / drawn_w;
             drawn_w = width;
@@ -170,24 +409,41 @@ static void paint(WINDOW* self, int x, int y, int width, int height) {
         }
         if (drawn_w < 1) drawn_w = 1;
         if (drawn_h < 1) drawn_h = 1;
-        left = x + (width - drawn_w) / 2;
-        top = y + (height - drawn_h) / 2;
 
-        /* One row of the picture as it will appear, then one call to put it
-           on the screen. A pixel at a time is two hundred thousand system
-           calls for one photograph, which is not slow but stopped - and it is
-           what this did until the kernel grew a blit. */
+        forget_scaled();
+        scaled = (koi_uint32*)koi_alloc((long)drawn_w * drawn_h * 4);
+        if (!scaled) {
+            mizu->label(x + 8, y + 8, "Not enough memory to show it.",
+                        mizu->color(MIZU_COLOR_TEXT));
+            return;
+        }
+        /* No yielding in here, and that is deliberate.
+         *
+         * This runs inside paint, which the desktop calls while it is drawing
+         * a frame. Letting go in the middle of that lets the desktop start
+         * another frame on top of the half-finished one, and what somebody
+         * sees is the wallpaper tearing for an instant whenever the window is
+         * resized. Reading the file yields, because reading is slow and
+         * happens outside painting; scaling is a few milliseconds and happens
+         * inside it. */
         for (int row = 0; row < drawn_h; row++) {
-            static koi_uint32 line[IMAGE_MAX_WIDTH];
             const koi_uint32* source =
                 pixels + (long)(row * image_height / drawn_h) * image_width;
-            int span = drawn_w > IMAGE_MAX_WIDTH ? IMAGE_MAX_WIDTH : drawn_w;
+            koi_uint32* into = scaled + (long)row * drawn_w;
 
-            for (int column = 0; column < span; column++)
-                line[column] = source[column * image_width / drawn_w];
-            koi_gfx_blit(left, top + row, span, 1, line, span);
+            for (int column = 0; column < drawn_w; column++)
+                into[column] = source[column * image_width / drawn_w];
         }
+        scaled_width = drawn_w;
+        scaled_height = drawn_h;
+        scaled_for_width = width;
+        scaled_for_height = height;
     }
+
+    /* And painting is this: one call. */
+    koi_gfx_blit(x + (width - scaled_width) / 2,
+                 y + (height - scaled_height) / 2,
+                 scaled_width, scaled_height, scaled, scaled_width);
 }
 
 static void menu(WINDOW* self, int id) {

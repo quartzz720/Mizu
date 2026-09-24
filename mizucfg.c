@@ -15,7 +15,31 @@
  */
 
 #define AUTOEXEC "\\AUTOEXEC.BAT"
-#define START_COMMAND "\\MIZU\\MIZU"
+
+/* Where the desktop is named now.
+ *
+ * It used to be a line in AUTOEXEC.BAT - `RING3 \MIZU\MIZU` - which made the
+ * desktop a command the shell happened to run last. The kernel has a setting
+ * for it now, and that is a different statement: the machine starts the
+ * desktop, the shell is underneath it, and a desktop that crashes is put back
+ * on its feet rather than dropping somebody at a prompt they did not ask for.
+ *
+ * Its own file in the configuration directory, because a file there has one
+ * owner and this one belongs to whichever desktop is installed. Two desktops
+ * cannot both be the desktop; contending for one file says so honestly, and it
+ * is the same contention they already had over one line of AUTOEXEC.BAT.
+ *
+ * The ring is the kernel's business now rather than ours: it starts whatever
+ * this names at ring 3, in an address space of its own, which is where a
+ * program that runs all day and runs everything else belongs.
+ *
+ * The old AUTOEXEC line is still recognised, and taking it out matters as much
+ * as writing the new setting: a machine set up before this would otherwise
+ * start the desktop twice. */
+#define DESKTOP_CONFIG "\\BOOT\\CONFIG\\DESKTOP.CFG"
+#define DESKTOP_SETTING "command = \\MIZU\\MIZU\r\n"
+#define START_COMMAND "RING3 \\MIZU\\MIZU"
+#define START_COMMAND_PLAIN "\\MIZU\\MIZU"
 #define FILE_MAX 4096
 
 static char file[FILE_MAX];
@@ -41,14 +65,37 @@ static int line_matches(const char* line, const char* command) {
     return 1;
 }
 
+/* Whether anything in the file names Mizu, wherever the file is. Deliberately
+   loose: a person who edited the setting by hand and wrote a different ring or
+   a drive letter still meant Mizu, and asking them again would be pedantry. */
+static int names_mizu(const char* text) {
+    for (long at = 0; text[at]; at++) {
+        int matched = 1;
+        const char* want = "MIZU";
+
+        for (int index = 0; want[index]; index++)
+            if (toupper((unsigned char)text[at + index]) != want[index]) {
+                matched = 0;
+                break;
+            }
+        if (matched) return 1;
+    }
+    return 0;
+}
+
 static int autostart_is_set(void) {
     long at = 0;
 
+    if (read_file(DESKTOP_CONFIG, file, FILE_MAX) >= 0 && names_mizu(file))
+        return 1;
+
+    /* And the way it was said before there was a setting. */
     if (read_file(AUTOEXEC, file, FILE_MAX) < 0) return 0;
     while (file[at]) {
         long start = at;
         while (file[at] && file[at] != '\n') at++;
         if (line_matches(file + start, START_COMMAND)) return 1;
+        if (line_matches(file + start, START_COMMAND_PLAIN)) return 1;
         if (file[at]) at++;
     }
     return 0;
@@ -73,25 +120,50 @@ static int set_autostart(int wanted) {
         length = at - start;
         if (file[at]) at++;
         if (line_matches(file + start, START_COMMAND)) continue;
+        if (line_matches(file + start, START_COMMAND_PLAIN)) continue;
         if (wanted && line_matches(file + start, "\\COMMANDER\\COMMANDER")) continue;
         if (!length) continue;
         for (long index = 0; index < length && out < FILE_MAX - 2; index++)
             rebuilt[out++] = file[start + index];
         rebuilt[out++] = '\n';
     }
-    if (wanted) {
-        const char* command = START_COMMAND;
-        for (int index = 0; command[index] && out < FILE_MAX - 2; index++)
-            rebuilt[out++] = command[index];
-        rebuilt[out++] = '\n';
-    }
     rebuilt[out] = 0;
 
+    /* AUTOEXEC.BAT is rewritten either way, because either way the old line
+       has to come out of it: with the setting written, a line that also starts
+       the desktop would start a second one. */
     koi_remove(AUTOEXEC);
     handle = koi_open(AUTOEXEC, OPEN_WRITE);
     if (handle < 0) return 0;
-    if (koi_write(handle, rebuilt, out) != out) { koi_close(handle); return 0; }
+    if (out && koi_write(handle, rebuilt, out) != out) {
+        koi_close(handle);
+        return 0;
+    }
     koi_close(handle);
+
+    if (!wanted) {
+        /* Only if it is ours. Another desktop may have been installed since,
+           and taking away its setting because somebody said No to ours is not
+           what No meant. */
+        if (read_file(DESKTOP_CONFIG, file, FILE_MAX) >= 0 && names_mizu(file))
+            koi_remove(DESKTOP_CONFIG);
+        return 1;
+    }
+
+    {
+        const char* setting = DESKTOP_SETTING;
+        long length = 0;
+
+        while (setting[length]) length++;
+        koi_remove(DESKTOP_CONFIG);
+        handle = koi_open(DESKTOP_CONFIG, OPEN_WRITE);
+        if (handle < 0) return 0;
+        if (koi_write(handle, setting, length) != length) {
+            koi_close(handle);
+            return 0;
+        }
+        koi_close(handle);
+    }
     return 1;
 }
 
@@ -116,15 +188,17 @@ static const char* const welcome[LANGUAGE_COUNT] = {
 
 static const char* const ask_autostart[LANGUAGE_COUNT] = {
     "Start Mizu automatically when the machine boots?\n"
-    "This adds one line to AUTOEXEC.BAT, and answering No later takes it out "
-    "again.",
+    "Then the desktop is what this machine starts, and Koi-DOS is underneath "
+    "it. Answering No later gives the prompt back.",
     "Запускать Mizu автоматически при загрузке машины?\n"
-    "Это добавит одну строку в AUTOEXEC.BAT; ответ Нет позже уберёт её.",
+    "Тогда машина запускает рабочий стол, а Koi-DOS остаётся под ним. "
+    "Ответ Нет позже вернёт приглашение командной строки.",
     "Запускати Mizu автоматично під час завантаження?\n"
-    "Це додасть один рядок до AUTOEXEC.BAT; відповідь Ні згодом прибере його.",
+    "Тоді машина запускає робочий стіл, а Koi-DOS лишається під ним. "
+    "Відповідь Ні згодом поверне командний рядок.",
     "Να ξεκινά το Mizu αυτόματα κατά την εκκίνηση του υπολογιστή;\n"
-    "Αυτό προσθέτει μία γραμμή στο AUTOEXEC.BAT και αν αργότερα απαντήσετε "
-    "Όχι, η γραμμή θα αφαιρεθεί."
+    "Τότε το μηχάνημα ξεκινά την επιφάνεια εργασίας και το Koi-DOS βρίσκεται "
+    "από κάτω. Αν αργότερα απαντήσετε Όχι, επιστρέφει η γραμμή εντολών."
 };
 
 static const char* const ask_sound[LANGUAGE_COUNT] = {

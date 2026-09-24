@@ -95,11 +95,24 @@ static int is_graphical(const char* line) {
     return 0;
 }
 
+/* Where the shell is standing, for the prompt.
+ *
+ * This used to be the two characters "Z:" written into the format string, and
+ * it stayed "Z:" after `Y:` had changed drives - a window telling somebody
+ * they were somewhere they were not. The shell knows; ask it. */
+static const char* where(void) {
+    static char place[80];
+
+    if (koi_systext(KOI_TEXT_WORKING_DIRECTORY, 0, place, sizeof(place)) <= 0)
+        koi_snprintf(place, sizeof(place), "Z:\\");
+    return place;
+}
+
 static void run_line(void) {
     char shown[LINE_MAX];
     long length;
 
-    koi_snprintf(shown, sizeof(shown), "Z:\\> %s", input);
+    koi_snprintf(shown, sizeof(shown), "%s> %s", where(), input);
     add_line(shown, (long)strlen(shown));
 
     if (!input[0]) { input_length = 0; return; }
@@ -149,7 +162,7 @@ static void paint(WINDOW* self, int x, int y, int width, int height) {
 
     /* The line being typed, at the bottom, with a caret - which is where a
        prompt belongs and where the eye already is. */
-    koi_snprintf(prompt, sizeof(prompt), "Z:\\> %s_", input);
+    koi_snprintf(prompt, sizeof(prompt), "%s> %s_", where(), input);
     mizu->label(x + 4, y + height - WINDOW_CHAR_H, prompt, ink());
 }
 

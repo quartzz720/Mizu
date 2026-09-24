@@ -99,6 +99,27 @@ struct WINDOW {
        it is still inside the first. */
     koi_uint64 ticked;
     int busy;
+    int needs_paint;
+    /* The right button, in the window's own coordinates.
+     *
+     * Separate from `click` rather than a button number added to it, because
+     * every application already implements `click` and none of them would
+     * have been checking a parameter that did not exist. A window that wants
+     * a context menu says so by setting this; one that does not is one where
+     * the right button does nothing, which is the correct behaviour and comes
+     * for free. */
+    void (*context)(WINDOW* window, int x, int y);
+
+    /* The pointer moving with the left button held, after a press that landed
+     * in this window's contents.
+     *
+     * Separate from `click` for the same reason `context` is: a window that
+     * wants it says so, and one that does not is one where dragging does
+     * nothing - which is right for a list of files and wrong only for the
+     * things that select. The coordinates are the window's own, and they are
+     * not clamped to it: a hand that selects text usually leaves the window
+     * on the way, and stopping at the edge would stop the selection with it. */
+    void (*drag)(WINDOW* window, int x, int y);
 };
 
 #define WINDOW_EVENT_NONE 0
@@ -107,12 +128,23 @@ struct WINDOW {
 #define WINDOW_EVENT_QUIT 3        /* the desktop was asked to end */
 #define WINDOW_EVENT_KEY 4         /* a key nothing else wanted */
 #define WINDOW_EVENT_LAUNCHER 5    /* the taskbar button was pressed */
+/* The desktop itself was clicked - the wallpaper, with no window under the
+ * pointer. `x` and `y` say where, `id` how many clicks, and `button` which
+ * one. What is on the desktop is the desktop's business rather than this
+ * library's: it draws no icons and knows of none, and this is how whoever
+ * does hears about a click on them. */
+#define WINDOW_EVENT_DESKTOP 6
 
 typedef struct {
     int type;
     WINDOW* window;                /* which one, when it is about a window */
-    int id;                        /* the menu item, or the key */
+    int id;                        /* the menu item, the key, or the clicks */
+    int x, y;                      /* where, for a click on the desktop */
+    int button;                    /* WINDOW_BUTTON_LEFT or _RIGHT */
 } WINDOW_EVENT;
+
+#define WINDOW_BUTTON_LEFT 0
+#define WINDOW_BUTTON_RIGHT 1
 
 /* Take the screen. Returns 0 when it could not be had. */
 int window_open_desktop(const char* title);
@@ -148,6 +180,15 @@ void window_launcher_pressed(int pressed);
  * on the taskbar and a menu that grew downwards from there would grow off the
  * screen. */
 int window_popup(const WINDOW_ITEM* items, int count, int x, int y);
+
+/* The same menu, opening downwards from the point given rather than upwards -
+ * which is what a menu the right button opened does, at the pointer.
+ *
+ * It flips back upwards when there is no room below, because a menu running
+ * off the bottom of the screen is a menu with entries nobody can reach. Either
+ * button works it, so the press that opened it can be held, slid and released
+ * onto an entry the way the Start menu already allows. */
+int window_context(const WINDOW_ITEM* items, int count, int x, int y);
 
 /* A question in the middle of the screen, with the rest of it dimmed.
  *
@@ -219,6 +260,14 @@ void window_yield(void);
 /* End the loop. The next window_next returns 0. */
 void window_quit(void);
 
+/* Draw something of your own on the desktop, every time it is repainted.
+ *
+ * Called after the wallpaper and before any window, so what it draws is
+ * behind everything and in front of nothing. Icons are the reason it exists;
+ * this library has no idea what an icon means and should not acquire one.
+ * Pass null to stop. */
+void window_desktop_paint(void (*paint)(void));
+
 /* Ask for everything to be drawn again. Called for you when a window moves or
    the order changes; call it yourself when a window's contents change. */
 void window_repaint(void);
@@ -242,6 +291,63 @@ void window_label(int x, int y, const char* text, koi_uint32 color);
 /* The same with KOI_TEXT_BOLD / ITALIC / UNDERLINE. */
 void window_label_styled(int x, int y, const char* text, koi_uint32 color,
                          int style);
+
+/* ---- Icons ---------------------------------------------------------------
+ *
+ * A picture with one colour treated as "not there": magenta, 255,0,255, the
+ * way every 16-colour system did it and for the same reason - a BMP has no
+ * alpha channel, and one colour nobody would draw with costs nothing to
+ * reserve. A pixel of exactly that colour is skipped; every other pixel is
+ * drawn as it is.
+ *
+ * Loaded once and kept. An icon is at most 32x32, which is four kilobytes,
+ * and the alternative is reading a file every time a window is repainted.
+ *
+ * Named by the file rather than by what it means, and the name is looked for
+ * beside the program: `window_icon("FILES32.BMP")`. Names are what the
+ * drawings are called, so the code and the ICONS.md that the drawings were
+ * made from say the same word.
+ *
+ * Returns a handle to draw with, or 0 when there is no such file - which is
+ * not an error worth stopping for. A desktop whose icons have not been
+ * installed should be a desktop with no pictures on it, not a desktop that
+ * refuses to start. */
+int window_icon(const char* name);
+
+/* Draw one, top-left at x,y. A handle of 0 draws nothing, so a caller may
+   pass the result of window_icon() straight in without testing it. */
+void window_icon_draw(int icon, int x, int y);
+
+/* How wide and tall that icon is, or 0. For laying a row of them out without
+   assuming the size the file turned out to be. */
+int window_icon_width(int icon);
+int window_icon_height(int icon);
+
+#define WINDOW_ICON_MAX_SIZE 32
+
+/* ---- The scrollbar -------------------------------------------------------
+ *
+ * For a window whose contents are longer than it is. The caller counts in
+ * whatever its items are - lines, files, wrapped rows - and says how many
+ * there are, how many fit and which is first; this draws the bar and answers
+ * where a click or a drag should move to.
+ *
+ * `window_scrollbar_press` is for a press: the arrows step by one, the trough
+ * above or below the thumb pages, and a press on the thumb itself changes
+ * nothing and waits for the drag. `window_scrollbar_drag` is for the pointer
+ * moving with the button down, and puts the thumb under it.
+ *
+ * All three take the bar's own y and height, so an application that puts it
+ * beside a toolbar does not have to tell three functions the same arithmetic
+ * twice. */
+#define WINDOW_SCROLLBAR_W 16
+
+void window_scrollbar(int x, int y, int height, int top, int visible,
+                      int total);
+int window_scrollbar_press(int y, int height, int top, int visible, int total,
+                           int point_y);
+int window_scrollbar_drag(int y, int height, int visible, int total,
+                          int point_y);
 
 #define WINDOW_CHAR_W 8
 #define WINDOW_CHAR_H 16
